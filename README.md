@@ -16,3 +16,8 @@ where:
     port - use different port for IP camera, by default 554
     /path - profile endpoint
 
+## TODO
+
+- overwrite IP-addresses in responses (RTP-Info, Transport headers), SDP
+- interleaving support
+- RTP connections
