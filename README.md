@@ -1,7 +1,9 @@
-# RTSP proxy
+# RTSP/1.0 proxy
 
 Proxy RTSP/RTP connections to real RTSP IP-cameras to save bandwidth.
 Based on [djwackey/dorsvr](https://github.com/djwackey/dorsvr/ "dorsvr source code page").
+
+**!!! Under construction !!!**
 
 ## Synopsis
 
@@ -19,5 +21,5 @@ where:
 ## TODO
 
 - overwrite IP-addresses in responses (RTP-Info, Transport headers), SDP
-- interleaving support
+- finish interleaving support (handle Teardown and disconnections)
 - RTP connections

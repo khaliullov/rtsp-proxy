@@ -1,6 +1,7 @@
 package rtspproxy
 
 import (
+	"container/list"
 	"errors"
 	"fmt"
 	"log"
@@ -10,16 +11,36 @@ import (
 )
 
 type Request struct {
-	Command 		string
-	RawURL 			string
-	URL				url.URL
+	Method          string
+	RawURL          string
+	URL             *url.URL
 	ProtocolVersion string
-	Headers			map[string]string
-	Body			[]byte
+	Headers         map[string]string
+	Body            []byte
+	Attempts        int
+	Subscriptions   *list.List
 }
 
-func NewRequest(buffer string) (*Request, error) {
-	request := &Request{Headers: make(map[string]string)}
+func NewRequest(method string, URL *url.URL, args ...string) (*Request, error) {
+	protocolVersion := "RTSP/1.0"
+	if len(args) > 0 && args[0] != "" {
+		protocolVersion = args[0]
+	}
+	request := &Request{
+		Method:          method,
+		ProtocolVersion: protocolVersion,
+		Headers:         make(map[string]string),
+		URL:             URL,
+		Subscriptions:   list.New(),
+	}
+	return request, nil
+}
+
+func NewRequestFromBuffer(buffer string) (*Request, error) {
+	request := &Request{
+		Headers:         make(map[string]string),
+		Subscriptions:   list.New(),
+	}
 	if buffer != "" {
 		err := request.ParseRequest(buffer)
 		if err != nil {
@@ -52,11 +73,11 @@ func (request *Request) getLine(startOfLine string) (thisLineStart, nextLineStar
 
 func (request *Request) ParseCommand(buffer string) error {
 	i := 0
-	request.Command = ""
+	request.Method = ""
 	request.RawURL = ""
 	request.ProtocolVersion = ""
 	for i = 0; i < len(buffer) && buffer[i] != ' ' && buffer[i] != '\t'; i++ {
-		request.Command += string(buffer[i])
+		request.Method += string(buffer[i])
 	}
 	i++;
 	for ; i < len(buffer) && buffer[i] != ' ' && buffer[i] != '\t'; i++ {
@@ -66,9 +87,9 @@ func (request *Request) ParseCommand(buffer string) error {
 	for ; i < len(buffer) && buffer[i] != ' ' && buffer[i] != '\t'; i++ {
 		request.ProtocolVersion += string(buffer[i])
 	}
-	if request.Command == "" || request.RawURL == "" || request.ProtocolVersion == "" {
+	if request.Method == "" || request.RawURL == "" || request.ProtocolVersion == "" {
 		log.Printf("Request: %s", buffer)
-		return errors.New("Command parse error")
+		return errors.New("Method parse error")
 	}
 	re := regexp.MustCompile(`^rtsp:\/\/[^:\/]+(:?[:]\d+)?\/(rtsp)\/(.*)`)
 	rawURL := re.ReplaceAllString(request.RawURL, "$2://$3")
@@ -77,7 +98,7 @@ func (request *Request) ParseCommand(buffer string) error {
 	if err != nil {
 		return err
 	}
-	request.URL = *URL
+	request.URL = URL
 	return nil
 }
 
@@ -133,7 +154,7 @@ func (request *Request) ParseRequest(buffer string) error {
 	return nil
 }
 
-func (request *Request) GetURL() string {
+func (request *Request) GetURL() *url.URL {
 	URL := request.URL
 
 	URL.User = nil
@@ -141,13 +162,13 @@ func (request *Request) GetURL() string {
 	if len(host) > 1 && host[1] == "554" {
 		URL.Host = host[0]
 	}
-	return URL.String()
+	return URL
 }
 
 func (request *Request) String() string {
 	URL := request.GetURL()
 
-	response := fmt.Sprintf("%s %s %s\r\n", request.Command, URL, request.ProtocolVersion)
+	response := fmt.Sprintf("%s %s %s\r\n", request.Method, URL.String(), request.ProtocolVersion)
 	for key, value := range request.Headers {
 		response += fmt.Sprintf("%s: %s\r\n", key, value)
 	}

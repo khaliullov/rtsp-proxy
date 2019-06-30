@@ -7,19 +7,19 @@ import (
 	"runtime"
 )
 
-type RTSPProxyServer struct {
+type Server struct {
 	rtspPort			int
 	rtspListener        *net.TCPListener
-	remotes				map[string]*RTSPProxyRemote
+	remotes				map[string]*Remote
 }
 
-func NewServer() *RTSPProxyServer {
+func NewServer() *Server {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	return &RTSPProxyServer{remotes: make(map[string]*RTSPProxyRemote)}
+	return &Server{remotes: make(map[string]*Remote)}
 }
 
-func (server *RTSPProxyServer) Listen (portNum int) error {
+func (server *Server) Listen(portNum int) error {
 	server.rtspPort = portNum
 
 	var err error
@@ -28,38 +28,38 @@ func (server *RTSPProxyServer) Listen (portNum int) error {
 	return err
 }
 
-func (server *RTSPProxyServer) setupOurSocket() (*net.TCPListener, error) {
+func (server *Server) setupOurSocket() (*net.TCPListener, error) {
 	tcpAddr := fmt.Sprintf("0.0.0.0:%d", server.rtspPort)
 	addr, _ := net.ResolveTCPAddr("tcp", tcpAddr)
 
 	return net.ListenTCP("tcp", addr)
 }
 
-func (server *RTSPProxyServer) Destroy() {
+func (server *Server) Destroy() {
 	server.rtspListener.Close()
 }
 
-func (server *RTSPProxyServer) LookupRemote(host string) *RTSPProxyRemote {
+func (server *Server) LookupRemote(host, username, password string) *Remote {
 	if remote, ok := server.remotes[host]; ok {
 		return remote
 	}
-	remote := NewRemote(server, host)
+	remote := NewRemote(server, host, username, password)
 	server.remotes[host] = remote
 	return remote
 }
 
-func (server *RTSPProxyServer) Start() {
+func (server *Server) Start() {
 	go server.incomingConnectionHandler()
 }
 
-func (server *RTSPProxyServer) newClientConnection(conn net.Conn) {
+func (server *Server) newClientConnection(conn net.Conn) {
 	client := NewClient(server, conn)
 	if client != nil {
 		client.incomingRequestHandler()
 	}
 }
 
-func (server *RTSPProxyServer) incomingConnectionHandler() {
+func (server *Server) incomingConnectionHandler() {
 	for {
 		tcpConn, err := server.rtspListener.AcceptTCP()
 		if err != nil {

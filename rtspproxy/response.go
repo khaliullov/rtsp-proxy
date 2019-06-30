@@ -14,8 +14,26 @@ type Response struct {
 	Body			string
 }
 
-func NewResponse(buffer string) (*Response, error) {
-	response := &Response{Headers: make(map[string]string)}
+func NewResponse(code int, args ...string) (*Response, error) {
+	status := "OK"
+	protocolVersion := "RTSP/1.0"
+	if len(args) > 0 {
+		status = args[0]
+	}
+	if len(args) > 1 {
+		protocolVersion = args[1]
+	}
+	response := &Response{
+		Code: code,
+		ProtocolVersion: protocolVersion,
+		Status: status,
+		Headers: make(map[string]string),
+	}
+	return response, nil
+}
+
+func NewResponseFromBuffer(buffer string) (*Response, error) {
+	response, _ := NewResponse(400, "Bad request")
 	if buffer != "" {
 		err := response.ParseResponse(buffer)
 		if err != nil {

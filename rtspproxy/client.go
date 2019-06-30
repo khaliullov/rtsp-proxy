@@ -1,54 +1,52 @@
 package rtspproxy
 
 import (
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
 	"net"
-	"regexp"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 const rtspBufferSize = 10000
 
-type RTSPProxyClient struct {
-	clientConn		net.Conn
-	localPort		string
-	remotePort		string
-	localAddr		string
-	remoteAddr		string
-	currentCSeq		string
-	responseBuffer	string
-	server			*RTSPProxyServer
-	digest			*Digest
+type Client struct {
+	ClientConn     net.Conn
+	localPort      string
+	remotePort     string
+	localAddr      string
+	remoteAddr     string
+	currentCSeq    string
+	responseBuffer string
+	server         *Server
 }
 
-func NewClient(server *RTSPProxyServer, socket net.Conn) *RTSPProxyClient {
+func NewClient(server *Server, socket net.Conn) *Client {
 	localAddr := strings.Split(socket.LocalAddr().String(), ":")
 	remoteAddr := strings.Split(socket.RemoteAddr().String(), ":")
-	return &RTSPProxyClient{
+	return &Client{
 		server:     server,
-		clientConn:	socket,
+		ClientConn: socket,
 		localAddr:  localAddr[0],
 		localPort:  localAddr[1],
 		remoteAddr: remoteAddr[0],
 		remotePort: remoteAddr[1],
-		digest:		NewDigest(),
 	}
 }
 
-func (client *RTSPProxyClient) destroy() error {
-	return client.clientConn.Close()
+func (client *Client) destroy() error {
+	return client.ClientConn.Close()
 }
 
-func (client *RTSPProxyClient) incomingRequestHandler() {
-	defer client.clientConn.Close()
+func (client *Client) incomingRequestHandler() {
+	defer client.ClientConn.Close()
 
 	var isclose bool
 	buffer := make([]byte, rtspBufferSize)
 	for {
-		length, err := client.clientConn.Read(buffer)
+		length, err := client.ClientConn.Read(buffer)
 
 		switch err {
 		case nil:
@@ -75,7 +73,7 @@ func (client *RTSPProxyClient) incomingRequestHandler() {
 	} */
 }
 
-func (client *RTSPProxyClient) handleRequestBytes(buffer []byte, length int) error {
+func (client *Client) handleRequestBytes(buffer []byte, length int) error {
 	if length < 0 {
 		return errors.New("EOF")
 	}
@@ -83,104 +81,136 @@ func (client *RTSPProxyClient) handleRequestBytes(buffer []byte, length int) err
 	reqStr := string(buffer[:length])
 
 	// request, err := client.parseRequest(reqStr)
-	request, err := NewRequest(reqStr)
-	cseq := ""
-
-	if _cseq, ok := request.Headers["CSeq"]; ok {
-		cseq = _cseq
-	}
+	request, err := NewRequestFromBuffer(reqStr)
 
 	if err != nil {
 		// bad request
+		return nil
 	}
 
-	remote := client.server.LookupRemote(request.URL.Host)
+	Username := request.URL.User.Username()
+	Password, _ := request.URL.User.Password()
+	remote := client.server.LookupRemote(request.URL.Host, Username, Password)
 
-	client.createAuthenticatorStr(request)
+	// TODO: force RTP separate connection: https://tools.ietf.org/html/rfc2326#page-40
+	// The interleaving should
+	//   generally be avoided unless necessary since it complicates client and
+	//   server operation and imposes additional overhead.
 
-	log.Printf("Got request: %s", request.String())
+	log.Printf("Got request from client:\n%s", request.String())
 
-	res, responseLength, err := remote.Request(request)
-
-	response, err := NewResponse(string(res[:responseLength]))
-
-	if err != nil {
-		return err
+	response := client.responseBadRequest(request)
+	switch request.Method {
+	case "OPTIONS":
+		response = client.handleOptions(remote, request)
+	case "DESCRIBE":
+		response = client.handleDescribe(remote, request)
+	case "SETUP":
+		response = client.handleSetup(remote, request)
+	case "PLAY":
+		response = client.handlePlay(remote, request)
 	}
 
+	/* if _, ok := response.Headers["Content-Base"]; ok {
+		response.Headers["Content-Base"] = request.RawURL + "/"
+	}
+	if rtpInfo, ok := response.Headers["RTP-Info"]; ok {
+		// TODO: replace IPs
+		response.Headers["RTP-Info"] = rtpInfo
+	} */
+
+	response.Headers["Via"] = "RTSP-Proxy"
+	cseq := client.getHeader(request, "CSeq")
 	if cseq != "" {
 		response.Headers["CSeq"] = cseq
 	}
-	if _, ok := response.Headers["Content-Base"]; ok {
-		response.Headers["Content-Base"] = request.RawURL + "/"
-	}
 
-	if response.Code == 401 {
-		if wwwAuthenticate, ok := response.Headers["WWW-Authenticate"]; ok {
-			if request.URL.User != nil {
-				client.digest.Username = request.URL.User.Username()
-				client.digest.Password, _ = request.URL.User.Password()
-			}
-			if client.handleAuthenticationFailure(wwwAuthenticate) {
-				return client.handleRequestBytes(buffer, length)
-			}
-		}
-	}
+	log.Printf("Sending response to client:\n%s", response)
 
-	log.Printf("Got response: %s", response)
-
-	client.clientConn.Write([]byte(response.String()))
+	client.ClientConn.Write([]byte(response.String()))
 
 	log.Printf("Received %d new bytes of request data.", length)
 	return nil
 }
 
-func (client *RTSPProxyClient) handleAuthenticationFailure(paramsStr string) bool {
-	// There was no "WWW-Authenticate:" header; we can't proceed.
-	if paramsStr == "" {
-		return false
+func (client *Client) getHeader(request *Request, key string) string {
+	value := ""
+
+	if _value, ok := request.Headers[key]; ok {
+		value = _value
 	}
 
-	digest_regex := regexp.MustCompile(`Digest realm="([^"]+)", nonce="([^"]+)"`)
-	basic_regex := regexp.MustCompile(`Basic realm="([^"]+)"`)
-
-	// Fill in "fCurrentAuthenticator" with the information from the "WWW-Authenticate:" header:
-	var matches []string
-	success := true
-	alreadyHadRealm := client.digest.Realm != ""
-
-	if matches = digest_regex.FindStringSubmatch(paramsStr); len(matches) == 3 {
-		client.digest.Realm = matches[1]
-		client.digest.Nonce = matches[2]
-	} else if matches = basic_regex.FindStringSubmatch(paramsStr); len(matches) == 2 {
-		client.digest.Realm = matches[1]
-		client.digest.RandomNonce()
-	} else {
-		success = false // bad "WWW-Authenticate:" header
-	}
-
-	// We already had a 'realm', or don't have a username and/or password,
-	// so the new "WWW-Authenticate:" header information won't help us.  We remain unauthenticated.
-	if alreadyHadRealm || client.digest.Username == "" || client.digest.Password == "" {
-		success = false
-	}
-
-	return success
+	return value
 }
 
-func (client *RTSPProxyClient) createAuthenticatorStr(request *Request) {
-	if client.digest.Realm != "" && client.digest.Username != "" && client.digest.Password != "" {
-		var response string
-		if client.digest.Nonce != "" { // digest authentication
-			URL := request.GetURL()
-			response = client.digest.ComputeResponse(request.Command, URL)
-			request.Headers["Authorization"] = fmt.Sprintf("Digest username=\"%s\", "+
-				"realm=\"%s\", nonce=\"%s\", uri=\"%s\", response=\"%s\"",
-				client.digest.Username, client.digest.Realm, client.digest.Nonce, URL, response)
-		} else { // basic authentication
-			usernamePassword := fmt.Sprintf("%s:%s", client.digest.Username, client.digest.Password)
-			response = base64.StdEncoding.EncodeToString([]byte(usernamePassword))
-			request.Headers["Authorization"] = fmt.Sprintf("Basic %s", response)
-		}
-	}
+func (client *Client) responseBadRequest(request *Request) *Response {
+	response, _ := NewResponse(400, "Bad Request")
+	return response
 }
+
+func (client *Client) handleOptions(remote *Remote, request *Request) *Response {
+	path := request.GetURL().Path
+	options, err := remote.GetOptions(path)
+	if err != nil {
+		return client.responseBadRequest(request)
+	}
+	stream := remote.LookupStream(path)
+	response, _ := NewResponse(200, "OK")
+	response.Headers["Public"] = options
+	response.Headers["Server"] = stream.Server
+	return response
+}
+
+func (client *Client) handleSetup(remote *Remote, request *Request) *Response {
+	streamName, substreamName := filepath.Split(request.GetURL().Path)
+	streamName = filepath.Dir(streamName)
+	transport := client.getHeader(request, "Transport")
+	ssrc, session, err := remote.GetSsrcSession(client, streamName, substreamName, transport)
+	if err != nil {
+		return client.responseBadRequest(request)
+	}
+	stream := remote.LookupStream(streamName)
+	response, _ := NewResponse(200, "OK")
+	response.Headers["Transport"] = fmt.Sprintf("%s;ssrc=%s;destination=%s;source=%s", transport, ssrc,
+		client.remoteAddr, client.localAddr)
+	response.Headers["Cache-Control"] = "must-revalidate"
+	response.Headers["Session"] = session + ";timeout=60"
+	response.Headers["Server"] = stream.Server
+	return response
+}
+
+func (client *Client) handleDescribe(remote *Remote, request *Request) *Response {
+	path := request.GetURL().Path
+	SDP, err := remote.GetSDP(path)
+	if err != nil {
+		return client.responseBadRequest(request)
+	}
+	stream := remote.LookupStream(path)
+	response, _ := NewResponse(200, "OK")
+	response.Headers["Content-Type"] = "application/sdp"
+	response.Headers["Server"] = stream.Server
+	response.Headers["Content-Length"] = strconv.Itoa(len(SDP))
+
+	// TODO: rewrite SDP
+	response.Body = SDP
+
+	return response
+}
+
+func (client *Client) handlePlay(remote *Remote, request *Request) *Response {
+	path := request.GetURL().Path
+	session := request.Headers["Session"]
+	rtpInfo, err := remote.GetRTPInfo(path, session)
+	if err != nil {
+		return client.responseBadRequest(request)
+	}
+	stream := remote.LookupStream(path)
+	response, _ := NewResponse(200, "OK")
+	response.Headers["Range"] = request.Headers["Range"]
+	response.Headers["Session"] = session
+	response.Headers["Server"] = stream.Server
+	response.Headers["RTP-Info"] = rtpInfo
+
+	return response
+}
+
