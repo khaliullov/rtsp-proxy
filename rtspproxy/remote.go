@@ -311,9 +311,9 @@ func (remote *Remote) GetSsrcSession(client *Client, streamName, substreamName, 
 	protocol, comType, params := remote.parseTransport(transportStr)
 	stream := remote.LookupStream(streamName)
 	transport := stream.LookupTransport(substreamName, protocol, comType)
+	index := len(remote.interlayers)
 	if len(transport.Substreams) != 2 {
 		if transport.Protocol == "RTP/AVP/TCP" {
-			index := len(remote.interlayers)
 			URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: streamName + "/" + substreamName}
 			request, _ := NewRequest("SETUP", URL)
 			request.Headers["Transport"] = fmt.Sprintf("%s;%s;interleaved=%d-%d", transport.Protocol, transport.ComType,
@@ -327,15 +327,32 @@ func (remote *Remote) GetSsrcSession(client *Client, streamName, substreamName, 
 			transport.Substreams[1] = NewSubstream(transport, substreamName)
 			transport.Substreams[1].Channel = index+1
 			remote.interlayers[index] = NewInterlayer(index, stream, transport, transport.Substreams[0])
-			channel, _ := strconv.Atoi(strings.Split(params["interleaved"], "-")[0])
-			remote.interlayers[index].Subscribers.PushBack(NewSubscriber(client, channel))
 			remote.interlayers[index+1] = NewInterlayer(index, stream, transport, transport.Substreams[1])
-			remote.interlayers[index+1].Subscribers.PushBack(NewSubscriber(client, channel+1))
 		} else {
 			return "", "", errors.New("protocol is not supported")
 		}
+	} else {
+		for i, interlayer := range remote.interlayers {
+			if interlayer.Transport.Protocol == protocol && interlayer.Transport.SubstreamName == substreamName {
+				index = i
+				break
+			}
+		}
 	}
+	channel, _ := strconv.Atoi(strings.Split(params["interleaved"], "-")[0])
+	remote.interlayers[index].Subscribers.PushBack(NewSubscriber(client, channel))
+	remote.interlayers[index+1].Subscribers.PushBack(NewSubscriber(client, channel+1))
 	return transport.Ssrc, transport.Session, nil
+}
+
+func (remote *Remote) Unsubscribe(client *Client) {
+	for _, interlayers := range remote.interlayers {
+		for e := interlayers.Subscribers.Front(); e != nil; e = e.Next() {
+			if e.Value.(*Subscriber).Client == client {
+				interlayers.Subscribers.Remove(e)
+			}
+		}
+	}
 }
 
 func (remote *Remote) GetRTPInfo(streamName, session string) (string, error) {
