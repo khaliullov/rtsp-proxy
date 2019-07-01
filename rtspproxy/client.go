@@ -13,14 +13,17 @@ import (
 const rtspBufferSize = 10000
 
 type Client struct {
-	ClientConn     net.Conn
-	localPort      string
-	remotePort     string
-	localAddr      string
-	remoteAddr     string
-	currentCSeq    string
-	responseBuffer string
-	server         *Server
+	ClientConn		net.Conn
+	localPort		string
+	remotePort		string
+	localAddr		string
+	remoteAddr		string
+	currentCSeq		string
+	responseBuffer	string
+	host			string
+	username		string
+	password		string
+	server			*Server
 }
 
 func NewClient(server *Server, socket net.Conn) *Client {
@@ -67,6 +70,10 @@ func (client *Client) incomingRequestHandler() {
 		}
 	}
 
+	remote := client.server.LookupRemote(client.host, client.username, client.password)
+	if remote != nil {
+		remote.Unsubscribe(client)
+	}
 	log.Printf("disconnected the connection[%s:%s].", client.remoteAddr, client.remotePort)
 	/* if c.clientSession != nil {
 		c.clientSession.destroy()
@@ -88,14 +95,10 @@ func (client *Client) handleRequestBytes(buffer []byte, length int) error {
 		return nil
 	}
 
-	Username := request.URL.User.Username()
-	Password, _ := request.URL.User.Password()
-	remote := client.server.LookupRemote(request.URL.Host, Username, Password)
-
-	// TODO: force RTP separate connection: https://tools.ietf.org/html/rfc2326#page-40
-	// The interleaving should
-	//   generally be avoided unless necessary since it complicates client and
-	//   server operation and imposes additional overhead.
+	client.username = request.URL.User.Username()
+	client.password, _ = request.URL.User.Password()
+	client.host = request.URL.Host
+	remote := client.server.LookupRemote(client.host, client.username, client.password)
 
 	log.Printf("Got request from client:\n%s", request.String())
 
@@ -109,15 +112,9 @@ func (client *Client) handleRequestBytes(buffer []byte, length int) error {
 		response = client.handleSetup(remote, request)
 	case "PLAY":
 		response = client.handlePlay(remote, request)
+	case "TEARDOWN":
+		response = client.handleTeardown(remote, request)
 	}
-
-	/* if _, ok := response.Headers["Content-Base"]; ok {
-		response.Headers["Content-Base"] = request.RawURL + "/"
-	}
-	if rtpInfo, ok := response.Headers["RTP-Info"]; ok {
-		// TODO: replace IPs
-		response.Headers["RTP-Info"] = rtpInfo
-	} */
 
 	response.Headers["Via"] = "RTSP-Proxy"
 	cseq := client.getHeader(request, "CSeq")
@@ -209,8 +206,19 @@ func (client *Client) handlePlay(remote *Remote, request *Request) *Response {
 	response.Headers["Range"] = request.Headers["Range"]
 	response.Headers["Session"] = session
 	response.Headers["Server"] = stream.Server
+	// TODO: rewrite rtpInfo
 	response.Headers["RTP-Info"] = rtpInfo
 
 	return response
 }
 
+func (client *Client) handleTeardown(remote *Remote, request *Request) *Response {
+	path := request.GetURL().Path
+	session := request.Headers["Session"]
+	stream := remote.LookupStream(path)
+	response, _ := NewResponse(200, "OK")
+	response.Headers["Session"] = session
+	response.Headers["Server"] = stream.Server
+
+	return response
+}
