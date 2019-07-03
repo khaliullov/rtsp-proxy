@@ -1,7 +1,7 @@
 package rtspproxy
 
 import (
-	"errors"
+	// "errors"
 	"fmt"
 	"log"
 	"net"
@@ -44,90 +44,79 @@ func (client *Client) destroy() error {
 }
 
 func (client *Client) incomingRequestHandler() {
-	defer client.ClientConn.Close()
+	defer func() {
+		log.Printf("disconnected the connection[%s:%s].", client.remoteAddr, client.remotePort)
+		client.ClientConn.Close()
+		if client.host != "" {
+			remote := client.server.LookupRemote(client.host, client.username, client.password)
+			if remote != nil {
+				log.Printf("unsubscribing")
+				remote.Unsubscribe(client)
+			}
+		}
+	}()
 
-	var isclose bool
 	buffer := make([]byte, rtspBufferSize)
+	length := 0
+
 	for {
-		length, err := client.ClientConn.Read(buffer)
+		recvLen, err := client.ClientConn.Read(buffer)
+		if err != nil {
+			//logger.Error("conn read data error:", err)
+			return
+		}
 
-		switch err {
-		case nil:
-			err = client.handleRequestBytes(buffer, length)
+		length += recvLen
+
+		if buffer[0] == '$' {
+			// TODO: process RTCP packets and send proper response
+			// log.Printf("Got RTCP packet: %08x", buffer[:length])
+			length = 0
+		} else {
+			reqStr := string(buffer[:length])
+
+			length = 0
+			request, err := NewRequestFromBuffer(reqStr)
+
 			if err != nil {
-				log.Printf("Failed to handle client Request Bytes: %v", err)
-				isclose = true
+				// bad request
+				return
 			}
-		default:
-			log.Printf("default: %v", err)
-			if err.Error() == "EOF" {
-				isclose = true
+
+			client.username = request.URL.User.Username()
+			client.password, _ = request.URL.User.Password()
+			client.host = request.URL.Host
+			remote := client.server.LookupRemote(client.host, client.username, client.password)
+
+			// log.Printf("Got request from client:\n%s", request.String())
+
+			response := client.responseBadRequest(request)
+			switch request.Method {
+			case "OPTIONS":
+				response = client.handleOptions(remote, request)
+			case "DESCRIBE":
+				response = client.handleDescribe(remote, request)
+			case "SETUP":
+				response = client.handleSetup(remote, request)
+			case "PLAY":
+				response = client.handlePlay(remote, request)
+			case "TEARDOWN":
+				response = client.handleTeardown(remote, request)
+			case "GET_PARAMETER":
+				response = client.handleGetParameter(remote, request)
 			}
+
+			response.Headers["Via"] = "RTSP-Proxy"
+			cseq := client.getHeader(request, "CSeq")
+			if cseq != "" {
+				response.Headers["CSeq"] = cseq
+			}
+
+			// log.Printf("Sending response to client:\n%s", response)
+
+			client.ClientConn.Write([]byte(response.String()))
 		}
-
-		if isclose {
-			break
-		}
 	}
-
-	remote := client.server.LookupRemote(client.host, client.username, client.password)
-	if remote != nil {
-		remote.Unsubscribe(client)
-	}
-	log.Printf("disconnected the connection[%s:%s].", client.remoteAddr, client.remotePort)
-	/* if c.clientSession != nil {
-		c.clientSession.destroy()
-	} */
-}
-
-func (client *Client) handleRequestBytes(buffer []byte, length int) error {
-	if length < 0 {
-		return errors.New("EOF")
-	}
-
-	reqStr := string(buffer[:length])
-
-	// request, err := client.parseRequest(reqStr)
-	request, err := NewRequestFromBuffer(reqStr)
-
-	if err != nil {
-		// bad request
-		return nil
-	}
-
-	client.username = request.URL.User.Username()
-	client.password, _ = request.URL.User.Password()
-	client.host = request.URL.Host
-	remote := client.server.LookupRemote(client.host, client.username, client.password)
-
-	log.Printf("Got request from client:\n%s", request.String())
-
-	response := client.responseBadRequest(request)
-	switch request.Method {
-	case "OPTIONS":
-		response = client.handleOptions(remote, request)
-	case "DESCRIBE":
-		response = client.handleDescribe(remote, request)
-	case "SETUP":
-		response = client.handleSetup(remote, request)
-	case "PLAY":
-		response = client.handlePlay(remote, request)
-	case "TEARDOWN":
-		response = client.handleTeardown(remote, request)
-	}
-
-	response.Headers["Via"] = "RTSP-Proxy"
-	cseq := client.getHeader(request, "CSeq")
-	if cseq != "" {
-		response.Headers["CSeq"] = cseq
-	}
-
-	log.Printf("Sending response to client:\n%s", response)
-
-	client.ClientConn.Write([]byte(response.String()))
-
-	log.Printf("Received %d new bytes of request data.", length)
-	return nil
 }
 
 func (client *Client) getHeader(request *Request, key string) string {
@@ -142,6 +131,17 @@ func (client *Client) getHeader(request *Request, key string) string {
 
 func (client *Client) responseBadRequest(request *Request) *Response {
 	response, _ := NewResponse(400, "Bad Request")
+	return response
+}
+
+func (client *Client) handleGetParameter(remote *Remote, request *Request) *Response {
+	path := request.GetURL().Path
+	session := request.Headers["Session"]
+	stream := remote.LookupStream(path)
+	response, _ := NewResponse(200, "OK")
+	response.Headers["Session"] = session
+	response.Headers["Server"] = stream.Server
+
 	return response
 }
 
@@ -164,6 +164,7 @@ func (client *Client) handleSetup(remote *Remote, request *Request) *Response {
 	transport := client.getHeader(request, "Transport")
 	ssrc, session, err := remote.GetSsrcSession(client, streamName, substreamName, transport)
 	if err != nil {
+		log.Printf("Error while setup %s/%s: %v", streamName, substreamName, err)
 		return client.responseBadRequest(request)
 	}
 	stream := remote.LookupStream(streamName)

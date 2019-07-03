@@ -6,7 +6,6 @@ import (
 
 type Interlayer struct {
 	Channel		int
-	Active		bool
 	Stream		*Stream
 	Substream	*Substream
 	Transport   *Transport

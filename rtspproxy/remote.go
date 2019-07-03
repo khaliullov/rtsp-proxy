@@ -1,6 +1,7 @@
 package rtspproxy
 
 import (
+	"bytes"
 	"container/list"
 	"encoding/base64"
 	"errors"
@@ -40,7 +41,7 @@ func (remote *Remote) LookupStream(streamName string) *Stream {
 	if stream, ok := remote.streams[streamName]; ok {
 		return stream
 	} else {
-		stream := NewStream(streamName)
+		stream := NewStream(remote, streamName)
 		remote.streams[streamName] = stream
 		return stream
 	}
@@ -122,6 +123,7 @@ func (remote *Remote) incomingRequestHandler() {
 		if re := recover(); re != nil {
 			log.Printf("Remote Handle panic: %v", re)
 		}
+		log.Printf("disconnected the connection [%s:%s].", remote.remoteAddr, remote.remotePort)
 		remote.RemoteConn.Close()
 	}()
 
@@ -169,14 +171,26 @@ func (remote *Remote) incomingRequestHandler() {
 			length = copy(buffer, buffer[STREAM_HEADER_LENGTH+streamDataLength:length])
 			remote.handleStream(tcpChannel, streamDataLength, dataBuffer)
 		} else {
-			recv := string(buffer[:length])
+			eol := bytes.Index(buffer, []byte("$"))
+			if eol == -1 {
+				eol = length
+			}
+
+			recv := string(buffer[:eol])
+			// log.Printf("Raw request: %s", recv)
+
+			if eol > 0 && eol != length {
+				length = copy(buffer, buffer[eol:length])
+			} else {
+				length = 0
+			}
 
 			response, err := NewResponseFromBuffer(recv)
 			if err != nil {
 				log.Printf("remote rtsp read request error: %v", err)
 				return
 			}
-			log.Printf("Get response from remote:\n%s", response.String())
+			// log.Printf("Get response from remote:\n%s", response.String())
 			requestEl := remote.requests.Front()
 			request := requestEl.Value.(*Request)
 			remote.requests.Remove(requestEl)
@@ -203,16 +217,13 @@ func (remote *Remote) incomingRequestHandler() {
 				}
 			}
 			for e := request.Subscriptions.Front(); e != nil; e = e.Next() {
-				log.Printf("sending OK to chan")
+				// log.Printf("sending OK to chan")
 				e.Value.(chan string) <- "ok"
 				request.Subscriptions.Remove(e)
 			}
 
-			length = 0
 		}
 	}
-
-	log.Printf("disconnected the connection [%s:%s].", remote.remoteAddr, remote.remotePort)
 }
 
 func (remote *Remote) handleOptions(request *Request, response *Response) {
@@ -246,11 +257,20 @@ func (remote *Remote) handleSetup(request *Request, response *Response) {
 	streamName = filepath.Dir(streamName)
 	protocol, comType, params := remote.parseTransport(response.Headers["Transport"])
 	stream := remote.LookupStream(streamName)
-	transport := stream.LookupTransport(substreamName, protocol, comType)
+	sessionParams := strings.Split(response.Headers["Session"], ";")
+	session := stream.LookupSession(sessionParams[0])
+	transport := session.LookupTransport(substreamName, protocol, comType)
 	transport.Ssrc = params["ssrc"]
-	if transport.Session == "" {
-		session := strings.Split(response.Headers["Session"], ";")
-		transport.Session = session[0]
+	if len(sessionParams) > 1 {
+		sessionParams = sessionParams[1:]
+		params := make(map[string]string)
+		for _, element := range sessionParams {
+			kv := strings.Split(element, "=")
+			params[kv[0]] = kv[1]
+		}
+		if timeout, ok := params["timeout"]; ok {
+			session.Timeout, _ = strconv.Atoi(timeout)
+		}
 	}
 }
 
@@ -258,9 +278,8 @@ func (remote *Remote) handlePlay(request *Request, response *Response) {
 	streamName := request.URL.Path
 	stream := remote.LookupStream(streamName)
 	rtpInfo := response.Headers["RTP-Info"]
-	session := request.Headers["Session"]
-	transports := stream.LookupTransportBySession(session)
-	// url=rtsp://192.168.20.2/profile1/track1;seq=52326;rtptime=1781120107,url=rtsp://192.168.20.2/profile1/track2;seq=44529;rtptime=572932177
+	session := stream.LookupSession(request.Headers["Session"])
+	transports := session.Transports
 	for _, rtp := range strings.Split(rtpInfo, ",") {
 		params := make(map[string]string)
 		for _, param := range strings.Split(rtp, ";") {
@@ -277,6 +296,7 @@ func (remote *Remote) handlePlay(request *Request, response *Response) {
 			}
 		}
 	}
+	session.Start()
 }
 
 func (remote *Remote) GetOptions(streamName string) (string, error) {
@@ -312,15 +332,19 @@ func (remote *Remote) GetSsrcSession(client *Client, streamName, substreamName, 
 	stream := remote.LookupStream(streamName)
 	transport := stream.LookupTransport(substreamName, protocol, comType)
 	index := len(remote.interlayers)
-	if len(transport.Substreams) != 2 {
-		if transport.Protocol == "RTP/AVP/TCP" {
+	if transport == nil {
+		if protocol == "RTP/AVP/TCP" {
 			URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: streamName + "/" + substreamName}
 			request, _ := NewRequest("SETUP", URL)
-			request.Headers["Transport"] = fmt.Sprintf("%s;%s;interleaved=%d-%d", transport.Protocol, transport.ComType,
+			request.Headers["Transport"] = fmt.Sprintf("%s;%s;interleaved=%d-%d", protocol, comType,
 				index, index+1)
 			err := remote.SendRequestSync(request)
 			if err != nil {
 				return "", "", err
+			}
+			transport = stream.LookupTransport(substreamName, protocol, comType)
+			if transport == nil {
+				return "", "", errors.New("could not create transport")
 			}
 			transport.Substreams[0] = NewSubstream(transport, substreamName)
 			transport.Substreams[0].Channel = index
@@ -340,9 +364,10 @@ func (remote *Remote) GetSsrcSession(client *Client, streamName, substreamName, 
 		}
 	}
 	channel, _ := strconv.Atoi(strings.Split(params["interleaved"], "-")[0])
+	log.Printf("Channel: %d", index)
 	remote.interlayers[index].Subscribers.PushBack(NewSubscriber(client, channel))
 	remote.interlayers[index+1].Subscribers.PushBack(NewSubscriber(client, channel+1))
-	return transport.Ssrc, transport.Session, nil
+	return transport.Ssrc, transport.Session.Session, nil
 }
 
 func (remote *Remote) Unsubscribe(client *Client) {
@@ -355,25 +380,26 @@ func (remote *Remote) Unsubscribe(client *Client) {
 	}
 }
 
-func (remote *Remote) GetRTPInfo(streamName, session string) (string, error) {
+func (remote *Remote) GetRTPInfo(streamName, sessionId string) (string, error) {
 	stream := remote.LookupStream(streamName)
-	transports := stream.LookupTransportBySession(session)
+	session := stream.LookupSession(sessionId)
+	transports := session.Transports
 
 	if transports.Len() > 0 {
 		transport := transports.Front().Value.(*Transport)
 		if (transport.Substreams[0].Channel >= 0 && transport.Substreams[0].Seq == 0) {
 			URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: streamName}
 			request, _ := NewRequest("PLAY", URL)
-			request.Headers["Session"] = session
+			request.Headers["Session"] = sessionId
 			request.Headers["Range"] = "npt=0.000-"
 			err := remote.SendRequestSync(request)
 			if err != nil {
 				return "", err
 			}
 		}
-		parts := make([]string, stream.Transports.Len())
+		parts := make([]string, session.Transports.Len())
 		i := 0
-		for e := stream.Transports.Front(); e != nil; e = e.Next() {
+		for e := session.Transports.Front(); e != nil; e = e.Next() {
 			transport := e.Value.(*Transport)
 			URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: streamName + "/" + transport.SubstreamName}
 			parts[i] = fmt.Sprintf("url=%s;seq=%d;rtptime=%d", URL.String(), transport.Substreams[0].Seq,
@@ -402,9 +428,11 @@ func (remote *Remote) SendRequestSync(request *Request) error {
 func (remote *Remote) SendRequest(request *Request) error {
 	remote.currentCSeq++
 	request.Headers["CSeq"] = strconv.Itoa(remote.currentCSeq)
-	remote.createAuthenticatorStr(request)
+	if request.Method != "GET_PARAMETER" {
+		remote.createAuthenticatorStr(request)
+	}
 
-	log.Printf("Sending request to remote:\n%s", request)
+	// log.Printf("Sending request to remote:\n%s", request)
 
 	remote.requests.PushBack(request)
 

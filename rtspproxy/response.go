@@ -143,7 +143,11 @@ func (response *Response) ParseResponse(buffer string) error {
 		}
 		response.Headers[key] = value
 	}
-	response.Body = nextLineStart
+	if contentLengthRaw, ok := response.Headers["Content-Length"]; ok {
+		contentLength, _ := strconv.Atoi(contentLengthRaw)
+		response.Body = nextLineStart[0:contentLength-1]
+		return nil
+	}
 	return nil
 }
 

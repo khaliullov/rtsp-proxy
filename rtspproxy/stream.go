@@ -1,46 +1,53 @@
 package rtspproxy
 
-import (
-	"container/list"
-)
-
 type Stream struct {
-	streamName		string
+	StreamName		string
 	SDP				string
 	Options			string
 	Server			string
-	Transports		*list.List  // map[string]*Transport
+	Remote			*Remote
+	// Transports		*list.List  // map[string]*Transport
+	Sessions		map[string]*Session
 }
 
-func NewStream(streamName string) *Stream {
+func NewStream(remote *Remote, streamName string) *Stream {
 	stream := &Stream{
-		streamName: streamName,
-		Transports: list.New(),
+		StreamName: streamName,
+		// Transports: list.New(),
+		Remote: remote,
+		Sessions: make(map[string]*Session),
 	}
 	return stream
 }
 
 func (stream *Stream) LookupTransport(substreamName, protocol, comType string) *Transport {
-	for e := stream.Transports.Front(); e != nil; e = e.Next() {
-		transport := e.Value.(*Transport)
-		if transport.SubstreamName == substreamName && transport.Protocol == protocol && transport.ComType == comType {
-			return transport
+	for _, session := range stream.Sessions {
+		for e := session.Transports.Front(); e != nil; e = e.Next() {
+			transport := e.Value.(*Transport)
+			if transport.SubstreamName == substreamName && transport.Protocol == protocol && transport.ComType == comType {
+				return transport
+			}
 		}
 	}
 
-	transport := NewTransport(stream, substreamName, protocol, comType)
-	stream.Transports.PushBack(transport)
-
-	return transport
+	return nil
 }
 
-func (stream *Stream) LookupTransportBySession(session string) *list.List {
-	transports := list.New()
-	for e := stream.Transports.Front(); e != nil; e = e.Next() {
-		transport := e.Value.(*Transport)
-		if transport.Session == session {
-			transports.PushBack(transport)
-		}
+
+
+func (stream *Stream) LookupSession(sessionId string, args ...int) *Session {
+	timeout := 60
+
+	if (len(args) > 0) {
+		timeout = args[0]
 	}
-	return transports
+
+	if session, ok := stream.Sessions[sessionId]; ok {
+		return session
+	}
+
+	session := NewSession(stream, sessionId, timeout)
+	stream.Sessions[sessionId] = session
+
+	return session
 }

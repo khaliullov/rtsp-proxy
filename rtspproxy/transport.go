@@ -1,28 +1,22 @@
 package rtspproxy
 
 type Transport struct {
-	// transportName	string
 	SubstreamName	string
-	Stream			*Stream
+	Session			*Session
 	Protocol		string		// RTP/AVP/TCP or RTP/AVP
 	ComType			string		// always unicast
 	Ssrc			string
-	Session			string
-
-	// Active			bool
-	// Interleaved		bool  Protocol
+	// Session			string
 	Substreams		map[int]*Substream
 }
 
-func NewTransport(stream *Stream, substreamName, protocol, comType string) *Transport {
+func NewTransport(session *Session, substreamName, protocol, comType string) *Transport {
 	transport := &Transport{
 		SubstreamName: substreamName,
-		Stream: stream,
+		Session: session,
 		Protocol: protocol,
 		ComType: comType,
 		Substreams: make(map[int]*Substream),
 	}
 	return transport
 }
-
-
