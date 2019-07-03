@@ -39,18 +39,18 @@ func NewClient(server *Server, socket net.Conn) *Client {
 	}
 }
 
-func (client *Client) destroy() error {
+func (client *Client) Destroy() error {
 	return client.ClientConn.Close()
 }
 
 func (client *Client) incomingRequestHandler() {
 	defer func() {
-		log.Printf("disconnected the connection[%s:%s].", client.remoteAddr, client.remotePort)
+		log.Printf("disconnected the client connection [%s:%s].", client.remoteAddr, client.remotePort)
 		client.ClientConn.Close()
 		if client.host != "" {
 			remote := client.server.LookupRemote(client.host, client.username, client.password)
 			if remote != nil {
-				log.Printf("unsubscribing")
+				// log.Printf("unsubscribing")
 				remote.Unsubscribe(client)
 			}
 		}
@@ -60,18 +60,48 @@ func (client *Client) incomingRequestHandler() {
 	length := 0
 
 	for {
-		recvLen, err := client.ClientConn.Read(buffer)
+		recvLen, err := client.ClientConn.Read(buffer[length:])
 		if err != nil {
 			//logger.Error("conn read data error:", err)
 			return
 		}
 
 		length += recvLen
+		if length == 0 {  // read empty buffer somehow ¯\_(ツ)_/¯
+			log.Printf("empty request")
+			continue
+		}
 
 		if buffer[0] == '$' {
 			// TODO: process RTCP packets and send proper response
 			// log.Printf("Got RTCP packet: %08x", buffer[:length])
-			length = 0
+			for length < STREAM_HEADER_LENGTH {
+				recvLen, err := client.ClientConn.Read(buffer[length:])
+				if err != nil {
+					log.Printf("remote conn read data error: %v", err)
+					return
+				}
+
+				length += recvLen
+			}
+
+			// tcpChannel := int(buffer[1])
+			streamDataLength := ((int(buffer[2]) << 8) | int(buffer[3]))
+
+			streamDataRecvLength := length - STREAM_HEADER_LENGTH
+
+			for streamDataRecvLength < streamDataLength {
+				recvLen, err := client.ClientConn.Read(buffer[length:])
+				if err != nil {
+					log.Printf("remote conn read data error: %v", err)
+					return
+				}
+
+				length += recvLen
+				streamDataRecvLength = length - STREAM_HEADER_LENGTH
+			}
+
+			length = copy(buffer, buffer[STREAM_HEADER_LENGTH+streamDataLength:length])
 		} else {
 			reqStr := string(buffer[:length])
 

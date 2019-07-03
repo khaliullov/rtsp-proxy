@@ -48,6 +48,12 @@ func (server *Server) LookupRemote(host, username, password string) *Remote {
 	return remote
 }
 
+func (server *Server) RemoveRemote(host string) {
+	if _, ok := server.remotes[host]; ok {
+		delete(server.remotes, host)
+	}
+}
+
 func (server *Server) Start() {
 	go server.incomingConnectionHandler()
 }

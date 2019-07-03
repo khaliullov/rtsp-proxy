@@ -21,5 +21,5 @@ where:
 ## TODO
 
 - overwrite IP-addresses in responses (RTP-Info, Transport headers), SDP
-- finish interleaving support (handle Teardown and disconnections)
+- process RTCP requests
 - RTP connections

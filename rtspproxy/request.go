@@ -88,7 +88,7 @@ func (request *Request) ParseCommand(buffer string) error {
 		request.ProtocolVersion += string(buffer[i])
 	}
 	if request.Method == "" || request.RawURL == "" || request.ProtocolVersion == "" {
-		log.Printf("Request: %s", buffer)
+		log.Printf("Request: %s, length: %d", buffer, len(buffer))
 		return errors.New("Method parse error")
 	}
 	re := regexp.MustCompile(`^rtsp:\/\/[^:\/]+(:?[:]\d+)?\/(rtsp)\/(.*)`)
@@ -138,6 +138,7 @@ func (request *Request) ParseRequest(buffer string) error {
 	err := request.ParseCommand(thisLineStart)
 
 	if err != nil {
+		log.Printf("Failed to parse request: %s, length: %d", buffer, len(buffer))
 		return err
 	}
 	for {

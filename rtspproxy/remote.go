@@ -99,6 +99,17 @@ func (remote *Remote) Dial() error {
 }
 
 func (remote *Remote) Destroy() error {
+	remote.Server.RemoveRemote(remote.Host)
+	for _, interlayers := range remote.interlayers {
+		for _, session := range interlayers.Stream.Sessions {
+			session.Stop()
+		}
+		for e := interlayers.Subscribers.Front(); e != nil; e = e.Next() {
+			subscriber := e.Value.(*Subscriber)
+			subscriber.Client.Destroy()
+			interlayers.Subscribers.Remove(e)
+		}
+	}
 	return remote.RemoteConn.Close()
 }
 
@@ -123,8 +134,8 @@ func (remote *Remote) incomingRequestHandler() {
 		if re := recover(); re != nil {
 			log.Printf("Remote Handle panic: %v", re)
 		}
-		log.Printf("disconnected the connection [%s:%s].", remote.remoteAddr, remote.remotePort)
-		remote.RemoteConn.Close()
+		log.Printf("disconnected the remote connection [%s:%s].", remote.remoteAddr, remote.remotePort)
+		remote.Destroy()
 	}()
 
 	buffer := make([]byte, rtspBufferSize)
@@ -214,6 +225,8 @@ func (remote *Remote) incomingRequestHandler() {
 					remote.handleSetup(request, response)
 				case "PLAY":
 					remote.handlePlay(request, response)
+				case "TEARDOWN":
+					remote.handleTeardown(request, response)
 				}
 			}
 			for e := request.Subscriptions.Front(); e != nil; e = e.Next() {
@@ -223,6 +236,25 @@ func (remote *Remote) incomingRequestHandler() {
 			}
 
 		}
+	}
+}
+
+// not actually called
+func (remote *Remote) handleTeardown(request *Request, response *Response) {
+	log.Printf("Handle teardown")
+	streamName := request.URL.Path
+	stream := remote.LookupStream(streamName)
+	session := stream.LookupSession(request.Headers["Session"])
+	session.Stop()
+	for e := session.Transports.Front(); e != nil; e = e.Next() {
+		transport := e.Value.(*Transport)
+		delete(remote.interlayers, transport.Substreams[0].Channel)
+		delete(remote.interlayers, transport.Substreams[1].Channel)
+	}
+	delete(stream.Sessions, request.Headers["Session"])
+	if len(remote.interlayers) == 0 {
+		log.Printf("no active sessions. closing connection")
+		remote.Destroy()
 	}
 }
 
@@ -363,8 +395,8 @@ func (remote *Remote) GetSsrcSession(client *Client, streamName, substreamName, 
 			}
 		}
 	}
+	index = index - index % 2  // sometimes got RTCP channel instead of RTP channel ¯\_(ツ)_/¯
 	channel, _ := strconv.Atoi(strings.Split(params["interleaved"], "-")[0])
-	log.Printf("Channel: %d", index)
 	remote.interlayers[index].Subscribers.PushBack(NewSubscriber(client, channel))
 	remote.interlayers[index+1].Subscribers.PushBack(NewSubscriber(client, channel+1))
 	return transport.Ssrc, transport.Session.Session, nil
