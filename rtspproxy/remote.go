@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Remote struct {
@@ -72,12 +73,15 @@ func NewRemote(server *Server, host, username, password string) *Remote {
 	if err != nil {
 		return nil
 	}
+	log.Printf("connected the remote connection [%s:%s].", remote.remoteAddr, remote.remotePort)
 
 	return remote
 }
 
 func (remote *Remote) Dial() error {
-	socket, err := net.DialTCP("tcp", nil, remote.addr)
+	timeout := 5
+	dialer := net.Dialer{Timeout: time.Duration(timeout) * time.Second}
+	socket, err := dialer.Dial("tcp", remote.Host)
 	if err != nil {
 		log.Printf("Failed to connect to the remote server: %s\n", err.Error())
 		return err
@@ -88,7 +92,7 @@ func (remote *Remote) Dial() error {
 	if remote.RemoteConn != nil {
 		remote.RemoteConn.Close()
 	}
-	remote.RemoteConn = socket
+	remote.RemoteConn, _ = socket.(*net.TCPConn)
 	remote.localAddr = localAddr[0]
 	remote.localPort = localAddr[1]
 	remote.remoteAddr = remoteAddr[0]

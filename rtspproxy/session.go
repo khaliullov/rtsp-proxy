@@ -51,7 +51,6 @@ func (session *Session) Stop() {
 
 func (session *Session) Start() {
 	timeout := session.Timeout - 5
-	timeout = 5
 	if timeout < 0 {
 		timeout = 1
 	}

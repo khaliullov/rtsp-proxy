@@ -44,6 +44,10 @@ func (server *Server) LookupRemote(host, username, password string) *Remote {
 		return remote
 	}
 	remote := NewRemote(server, host, username, password)
+	if remote == nil {
+		log.Printf("Failed to connect to remote host: %s", host)
+		return nil
+	}
 	server.remotes[host] = remote
 	return remote
 }

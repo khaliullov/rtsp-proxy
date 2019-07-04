@@ -29,7 +29,7 @@ type Client struct {
 func NewClient(server *Server, socket net.Conn) *Client {
 	localAddr := strings.Split(socket.LocalAddr().String(), ":")
 	remoteAddr := strings.Split(socket.RemoteAddr().String(), ":")
-	return &Client{
+	client := &Client{
 		server:     server,
 		ClientConn: socket,
 		localAddr:  localAddr[0],
@@ -37,6 +37,10 @@ func NewClient(server *Server, socket net.Conn) *Client {
 		remoteAddr: remoteAddr[0],
 		remotePort: remoteAddr[1],
 	}
+
+	log.Printf("accepted the client connection [%s:%s].", client.remoteAddr, client.remotePort)
+
+	return client
 }
 
 func (client *Client) Destroy() error {
@@ -118,6 +122,12 @@ func (client *Client) incomingRequestHandler() {
 			client.host = request.URL.Host
 			remote := client.server.LookupRemote(client.host, client.username, client.password)
 
+			if remote == nil {
+				response := client.responseNotFound(request)
+				client.ClientConn.Write([]byte(response.String()))
+				return
+			}
+
 			// log.Printf("Got request from client:\n%s", request.String())
 
 			response := client.responseBadRequest(request)
@@ -157,6 +167,11 @@ func (client *Client) getHeader(request *Request, key string) string {
 	}
 
 	return value
+}
+
+func (client *Client) responseNotFound(request *Request) *Response {
+	response, _ := NewResponse(404, "Stream Not Found")
+	return response
 }
 
 func (client *Client) responseBadRequest(request *Request) *Response {

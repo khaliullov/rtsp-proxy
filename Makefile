@@ -2,6 +2,7 @@ GOPATH := $(shell go env GOPATH)
 GODEP  := $(GOPATH)/bin/dep
 GOLINT := $(GOPATH)/bin/golint
 BINARY_NAME := rtsp-proxy
+PORT   := 8554
 packages = $$(go list ./... | egrep -v '/vendor/' | egrep -v '/cmd/')
 files = $$(find . -name '*.go' | egrep -v '/vendor/' | egrep -v '/cmd/')
 
@@ -22,7 +23,7 @@ build: vendor lint vet
 
 run:            ## run script with arguments. example: `make run -- arg1 arg2`
 run:
-	go run cmd/main.go $(filter-out $@, $(MAKECMDGOALS))
+	go run cmd/main.go $(filter-out $@, $(MAKECMDGOALS)) -port $(PORT)
 
 vet:            ## Run go vet
 vet:
