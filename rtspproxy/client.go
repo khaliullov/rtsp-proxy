@@ -117,9 +117,11 @@ func (client *Client) incomingRequestHandler() {
 				return
 			}
 
-			client.username = request.URL.User.Username()
-			client.password, _ = request.URL.User.Password()
-			client.host = request.URL.Host
+			if client.host == "" {
+				client.username = request.URL.User.Username()
+				client.password, _ = request.URL.User.Password()
+				client.host = request.URL.Host
+			}
 			remote := client.server.LookupRemote(client.host, client.username, client.password)
 
 			if remote == nil {
@@ -241,7 +243,7 @@ func (client *Client) handleDescribe(remote *Remote, request *Request) *Response
 }
 
 func (client *Client) handlePlay(remote *Remote, request *Request) *Response {
-	path := request.GetURL().Path
+	path := filepath.Clean(request.GetURL().Path)
 	session := request.Headers["Session"]
 	rtpInfo, err := remote.GetRTPInfo(path, session)
 	if err != nil {

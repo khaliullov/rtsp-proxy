@@ -498,7 +498,7 @@ func (remote *Remote) handleAuthenticationFailure(paramsStr string) bool {
 		remote.digest.Nonce = matches[2]
 	} else if matches = basicRegex.FindStringSubmatch(paramsStr); len(matches) == 2 {
 		remote.digest.Realm = matches[1]
-		remote.digest.RandomNonce()
+		// remote.digest.RandomNonce()
 	} else {
 		success = false // bad "WWW-Authenticate:" header
 	}
