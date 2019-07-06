@@ -196,6 +196,7 @@ func (client *Client) handleOptions(remote *Remote, request *Request) *Response 
 	path := request.GetURL().Path
 	options, err := remote.GetOptions(path)
 	if err != nil {
+		remote.Destroy()
 		return client.responseBadRequest(request)
 	}
 	stream := remote.LookupStream(path)
@@ -228,6 +229,7 @@ func (client *Client) handleDescribe(remote *Remote, request *Request) *Response
 	path := request.GetURL().Path
 	SDP, err := remote.GetSDP(path)
 	if err != nil {
+		remote.Destroy()
 		return client.responseBadRequest(request)
 	}
 	stream := remote.LookupStream(path)
@@ -247,6 +249,7 @@ func (client *Client) handlePlay(remote *Remote, request *Request) *Response {
 	session := request.Headers["Session"]
 	rtpInfo, err := remote.GetRTPInfo(path, session)
 	if err != nil {
+		remote.Destroy()
 		return client.responseBadRequest(request)
 	}
 	stream := remote.LookupStream(path)
