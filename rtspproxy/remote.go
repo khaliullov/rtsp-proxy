@@ -210,6 +210,7 @@ func (remote *Remote) incomingRequestHandler() {
 			request := requestEl.Value.(*Request)
 			remote.requests.Remove(requestEl)
 
+			status := "ok"
 			if response.Code == 401 && request.Attempts == 0 {
 				if wwwAuthenticate, ok := response.Headers["WWW-Authenticate"]; ok {
 					if remote.digest.Username != "" && remote.handleAuthenticationFailure(wwwAuthenticate) {
@@ -217,6 +218,8 @@ func (remote *Remote) incomingRequestHandler() {
 						remote.SendRequest(request)
 						length = 0
 						continue
+					} else {
+						status = "unauthorized"
 					}
 				}
 			} else {
@@ -235,7 +238,7 @@ func (remote *Remote) incomingRequestHandler() {
 			}
 			for e := request.Subscriptions.Front(); e != nil; e = e.Next() {
 				// log.Printf("sending OK to chan")
-				e.Value.(chan string) <- "ok"
+				e.Value.(chan string) <- status
 				request.Subscriptions.Remove(e)
 			}
 
@@ -456,7 +459,7 @@ func (remote *Remote) SendRequestSync(request *Request) error {
 	remote.SendRequest(request)
 	result := ipc.GetResponse()
 	if result != "ok" {
-		return errors.New("IPC error: " + result)
+		return errors.New(result)
 	}
 	return nil
 }

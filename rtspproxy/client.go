@@ -181,6 +181,11 @@ func (client *Client) responseBadRequest(request *Request) *Response {
 	return response
 }
 
+func (client *Client) responseUnauthorized(request *Request) *Response {
+	response, _ := NewResponse(401, "Unauthorized")
+	return response
+}
+
 func (client *Client) handleGetParameter(remote *Remote, request *Request) *Response {
 	path := request.GetURL().Path
 	session := request.Headers["Session"]
@@ -213,6 +218,7 @@ func (client *Client) handleSetup(remote *Remote, request *Request) *Response {
 	ssrc, session, err := remote.GetSsrcSession(client, streamName, substreamName, transport)
 	if err != nil {
 		log.Printf("Error while setup %s/%s: %v", streamName, substreamName, err)
+		remote.Destroy()
 		return client.responseBadRequest(request)
 	}
 	stream := remote.LookupStream(streamName)
@@ -230,6 +236,9 @@ func (client *Client) handleDescribe(remote *Remote, request *Request) *Response
 	SDP, err := remote.GetSDP(path)
 	if err != nil {
 		remote.Destroy()
+		if err.Error() == "unauthorized" {
+			return client.responseUnauthorized(request)
+		}
 		return client.responseBadRequest(request)
 	}
 	stream := remote.LookupStream(path)
