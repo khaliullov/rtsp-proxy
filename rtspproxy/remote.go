@@ -248,7 +248,6 @@ func (remote *Remote) incomingRequestHandler() {
 
 // not actually called
 func (remote *Remote) handleTeardown(request *Request, response *Response) {
-	log.Printf("Handle teardown")
 	streamName := request.URL.Path
 	stream := remote.LookupStream(streamName)
 	session := stream.LookupSession(request.Headers["Session"])
@@ -322,7 +321,7 @@ func (remote *Remote) handlePlay(request *Request, response *Response) {
 	for _, rtp := range strings.Split(rtpInfo, ",") {
 		params := make(map[string]string)
 		for _, param := range strings.Split(rtp, ";") {
-			kv := strings.Split(param, "=")
+			kv := strings.SplitN(param, "=", 2)
 			params[kv[0]] = kv[1]
 		}
 		URL, _ := url.Parse(params["url"])
