@@ -4,11 +4,13 @@ import (
 	"time"
 )
 
+// Ipc represents an Inter-Process Communication mechanism.
 type Ipc struct {
-	Channel			chan string
-	timeout			int
+	Channel chan string
+	timeout int
 }
 
+// NewIPC creates a new Ipc instance.
 func NewIPC(timeout ...int) *Ipc {
 	defautlTimeout := 10
 	if len(timeout) > 0 {
@@ -21,6 +23,7 @@ func NewIPC(timeout ...int) *Ipc {
 	return ipc
 }
 
+// GetResponse waits for a response on the IPC channel or times out.
 func (ipc *Ipc) GetResponse() string {
 	toSleep := time.Duration(ipc.timeout) * time.Second
 	defer close(ipc.Channel)

@@ -10,6 +10,7 @@ import (
 	"strings"
 )
 
+// Request represents an RTSP request.
 type Request struct {
 	Method          string
 	RawURL          string
@@ -21,6 +22,7 @@ type Request struct {
 	Subscriptions   *list.List
 }
 
+// NewRequest creates a new RTSP request.
 func NewRequest(method string, URL *url.URL, args ...string) (*Request, error) {
 	protocolVersion := "RTSP/1.0"
 	if len(args) > 0 && args[0] != "" {
@@ -36,10 +38,11 @@ func NewRequest(method string, URL *url.URL, args ...string) (*Request, error) {
 	return request, nil
 }
 
+// NewRequestFromBuffer creates a new RTSP request from a buffer.
 func NewRequestFromBuffer(buffer string) (*Request, error) {
 	request := &Request{
-		Headers:         make(map[string]string),
-		Subscriptions:   list.New(),
+		Headers:       make(map[string]string),
+		Subscriptions: list.New(),
 	}
 	if buffer != "" {
 		err := request.ParseRequest(buffer)
@@ -71,6 +74,7 @@ func (request *Request) getLine(startOfLine string) (thisLineStart, nextLineStar
 	return nextLineStart, thisLineStart
 }
 
+// ParseCommand parses the command line of an RTSP request.
 func (request *Request) ParseCommand(buffer string) error {
 	i := 0
 	request.Method = ""
@@ -79,11 +83,11 @@ func (request *Request) ParseCommand(buffer string) error {
 	for i = 0; i < len(buffer) && buffer[i] != ' ' && buffer[i] != '\t'; i++ {
 		request.Method += string(buffer[i])
 	}
-	i++;
+	i++
 	for ; i < len(buffer) && buffer[i] != ' ' && buffer[i] != '\t'; i++ {
 		request.RawURL += string(buffer[i])
 	}
-	i++;
+	i++
 	for ; i < len(buffer) && buffer[i] != ' ' && buffer[i] != '\t'; i++ {
 		request.ProtocolVersion += string(buffer[i])
 	}
@@ -109,7 +113,7 @@ func (request *Request) getHeader(buffer string) (string, string, error) {
 	for i = 0; i < len(buffer) && buffer[i] != ':'; i++ {
 		key += string(buffer[i])
 	}
-	i++;
+	i++
 	state := "skip whitespace"
 	for ; i < len(buffer); i++ {
 		switch state {
@@ -133,6 +137,7 @@ func (request *Request) getHeader(buffer string) (string, string, error) {
 	return key, value, nil
 }
 
+// ParseRequest parses an entire RTSP request from a buffer.
 func (request *Request) ParseRequest(buffer string) error {
 	nextLineStart, thisLineStart := request.getLine(buffer)
 	err := request.ParseCommand(thisLineStart)
@@ -155,6 +160,7 @@ func (request *Request) ParseRequest(buffer string) error {
 	return nil
 }
 
+// GetURL returns the URL of the request, with default RTSP port removed if present.
 func (request *Request) GetURL() *url.URL {
 	URL := request.URL
 

@@ -31,9 +31,8 @@ func main() {
 	if err != nil {
 		log.Printf("Failed to bind port: %d", portNum)
 		return
-	} else {
-		log.Printf("Listening on port: %d", portNum)
 	}
+	log.Printf("Listening on port: %d", portNum)
 
 	go server.Start()
 

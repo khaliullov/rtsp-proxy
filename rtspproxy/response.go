@@ -6,14 +6,16 @@ import (
 	"strconv"
 )
 
+// Response represents an RTSP response.
 type Response struct {
-	Status	 		string
+	Status          string
 	ProtocolVersion string
-	Code			int
-	Headers			map[string]string
-	Body			string
+	Code            int
+	Headers         map[string]string
+	Body            string
 }
 
+// NewResponse creates a new RTSP response.
 func NewResponse(code int, args ...string) (*Response, error) {
 	status := "OK"
 	protocolVersion := "RTSP/1.0"
@@ -24,14 +26,15 @@ func NewResponse(code int, args ...string) (*Response, error) {
 		protocolVersion = args[1]
 	}
 	response := &Response{
-		Code: code,
+		Code:            code,
 		ProtocolVersion: protocolVersion,
-		Status: status,
-		Headers: make(map[string]string),
+		Status:          status,
+		Headers:         make(map[string]string),
 	}
 	return response, nil
 }
 
+// NewResponseFromBuffer creates a new RTSP response from a buffer.
 func NewResponseFromBuffer(buffer string) (*Response, error) {
 	response, _ := NewResponse(400, "Bad request")
 	if buffer != "" {
@@ -64,6 +67,7 @@ func (response *Response) getLine(startOfLine string) (thisLineStart, nextLineSt
 	return nextLineStart, thisLineStart
 }
 
+// ParseStatus parses the status line of an RTSP response.
 func (response *Response) ParseStatus(buffer string) error {
 	i := 0
 	response.Status = ""
@@ -72,7 +76,7 @@ func (response *Response) ParseStatus(buffer string) error {
 	for i = 0; i < len(buffer) && buffer[i] != ' ' && buffer[i] != '\t'; i++ {
 		response.ProtocolVersion += string(buffer[i])
 	}
-	i++;
+	i++
 	code := ""
 	for ; i < len(buffer) && buffer[i] != ' ' && buffer[i] != '\t'; i++ {
 		code += string(buffer[i])
@@ -84,7 +88,7 @@ func (response *Response) ParseStatus(buffer string) error {
 			return err
 		}
 	}
-	i++;
+	i++
 	for ; i < len(buffer) && buffer[i] != '\r' && buffer[i] != '\n'; i++ {
 		response.Status += string(buffer[i])
 	}
@@ -101,7 +105,7 @@ func (response *Response) getHeader(buffer string) (string, string, error) {
 	for i = 0; i < len(buffer) && buffer[i] != ':'; i++ {
 		key += string(buffer[i])
 	}
-	i++;
+	i++
 	state := "skip whitespace"
 	for ; i < len(buffer); i++ {
 		switch state {
@@ -125,6 +129,7 @@ func (response *Response) getHeader(buffer string) (string, string, error) {
 	return key, value, nil
 }
 
+// ParseResponse parses an entire RTSP response from a buffer.
 func (response *Response) ParseResponse(buffer string) error {
 	nextLineStart, thisLineStart := response.getLine(buffer)
 	err := response.ParseStatus(thisLineStart)
@@ -145,12 +150,13 @@ func (response *Response) ParseResponse(buffer string) error {
 	}
 	if contentLengthRaw, ok := response.Headers["Content-Length"]; ok {
 		contentLength, _ := strconv.Atoi(contentLengthRaw)
-		response.Body = nextLineStart[0:contentLength-1]
+		response.Body = nextLineStart[0 : contentLength-1]
 		return nil
 	}
 	return nil
 }
 
+// String returns the string representation of the RTSP response.
 func (response *Response) String() string {
 	res := fmt.Sprintf("%s %d %s\r\n", response.ProtocolVersion, response.Code, response.Status)
 	for key, value := range response.Headers {
@@ -162,4 +168,3 @@ func (response *Response) String() string {
 	}
 	return res
 }
-

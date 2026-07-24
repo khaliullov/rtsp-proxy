@@ -7,18 +7,21 @@ import (
 	"runtime"
 )
 
+// Server represents the RTSP proxy server.
 type Server struct {
-	rtspPort			int
-	rtspListener        *net.TCPListener
-	remotes				map[string]*Remote
+	rtspPort     int
+	rtspListener *net.TCPListener
+	remotes      map[string]*Remote
 }
 
+// NewServer creates a new Server instance.
 func NewServer() *Server {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	return &Server{remotes: make(map[string]*Remote)}
 }
 
+// Listen starts the server listening on the specified port.
 func (server *Server) Listen(portNum int) error {
 	server.rtspPort = portNum
 
@@ -35,10 +38,12 @@ func (server *Server) setupOurSocket() (*net.TCPListener, error) {
 	return net.ListenTCP("tcp", addr)
 }
 
+// Destroy closes the server's listener.
 func (server *Server) Destroy() {
 	server.rtspListener.Close()
 }
 
+// LookupRemote retrieves an existing remote connection or creates a new one.
 func (server *Server) LookupRemote(host, username, password string) *Remote {
 	if remote, ok := server.remotes[host]; ok {
 		return remote
@@ -52,12 +57,14 @@ func (server *Server) LookupRemote(host, username, password string) *Remote {
 	return remote
 }
 
+// RemoveRemote removes a remote connection from the server's management.
 func (server *Server) RemoveRemote(host string) {
 	if _, ok := server.remotes[host]; ok {
 		delete(server.remotes, host)
 	}
 }
 
+// Start begins accepting incoming client connections.
 func (server *Server) Start() {
 	go server.incomingConnectionHandler()
 }
