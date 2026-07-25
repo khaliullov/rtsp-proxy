@@ -16,6 +16,18 @@ where:
     port - use different port for IP camera, by default 554
     /path - profile endpoint
 
+## Usage
+
+To run the proxy:
+
+```bash
+./rtsp-proxy -port 8554 -log /var/log/rtsp-proxy.log -verbose
+```
+
+-   `-port`: Specifies the port the proxy server will listen on (default: 554).
+-   `-log`: Specifies the log file path (default: `-` for stderr).
+-   `-verbose`: Enables verbose logging, showing detailed request/response and authentication information. Off by default.
+
 ## Features / Improvements
 
 -   **Multi-client support**: Multiple clients can connect to the same RTSP stream from a remote camera, with the proxy efficiently fanning out the media data.
@@ -26,10 +38,10 @@ where:
 -   **Subscriber Management**: Monitors active subscribers and tears down remote sessions when no clients are connected, conserving resources.
 -   **Interleaved Data Handling**: Properly processes and forwards interleaved RTP/RTCP binary data.
 -   **Robust Error Handling**: Enhanced logging and error recovery for client and remote connections.
+-   **Configurable Logging**: Added a `-verbose` flag to control logging verbosity.
 
 ## TODO
 
 -   Add support for UDP transport (currently only TCP interleaved is supported).
 -   Implement more robust error handling and graceful shutdown.
--   Improve logging verbosity configuration.
 -   Consider adding support for other authentication schemes if needed.
