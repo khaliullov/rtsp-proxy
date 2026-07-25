@@ -11,9 +11,12 @@ import (
 func main() {
 	var logFile string
 	var portNum int
+	var verbose bool
 	flag.StringVar(&logFile, "log", "-", "log file")
 	flag.IntVar(&portNum, "port", 554, "server port")
+	flag.BoolVar(&verbose, "verbose", false, "enable verbose logging")
 	flag.Parse()
+
 	if logFile == "-" {
 		log.SetOutput(os.Stderr)
 	} else {
@@ -24,6 +27,9 @@ func main() {
 		defer f.Close()
 		log.SetOutput(f)
 	}
+
+	rtspproxy.SetVerbose(verbose) // Set the verbose flag in the rtspproxy package
+
 	server := rtspproxy.NewServer()
 
 	err := server.Listen(portNum)

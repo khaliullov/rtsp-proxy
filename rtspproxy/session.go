@@ -2,7 +2,6 @@ package rtspproxy
 
 import (
 	"container/list"
-	"log"
 	"net/url"
 	"time"
 )
@@ -74,7 +73,7 @@ func (session *Session) Start() {
 			// 🔥 ЗАЩИТА ОТ ПАНИКИ: recover ловит любые падения внутри горутины
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("⚠️ [SESSION] Keep-alive panic recovered for session %s: %v", session.Session, r)
+					LogCriticalf("⚠️ [SESSION] Keep-alive panic recovered for session %s: %v", session.Session, r)
 				}
 				ticker.Stop()
 				session.started = false
@@ -87,7 +86,7 @@ func (session *Session) Start() {
 
 					// 🔥 ПРОВЕРКА: Если Remote уже уничтожен или отключен, выходим
 					if remote == nil {
-						log.Printf("⚠️ [SESSION] Remote is nil, stopping keep-alive for session %s", session.Session)
+						LogCriticalf("⚠️ [SESSION] Remote is nil, stopping keep-alive for session %s", session.Session)
 						return
 					}
 
@@ -98,7 +97,7 @@ func (session *Session) Start() {
 					// 🔥 ОБРАБОТКА ОШИБОК: Если keep-alive не прошел, сессия, скорее всего, мертва
 					err := remote.SendRequestSync(request)
 					if err != nil {
-						log.Printf("⚠️ [SESSION] Keep-alive failed for session %s: %v. Stopping.", session.Session, err)
+						LogCriticalf("⚠️ [SESSION] Keep-alive failed for session %s: %v. Stopping.", session.Session, err)
 						return
 					}
 
@@ -121,7 +120,7 @@ func (session *Session) Start() {
 					}
 
 					if session.nosubscribers > 5 {
-						log.Printf("No subscribers for a long time for session %s. Tearing down.", session.Session)
+						LogCriticalf("No subscribers for a long time for session %s. Tearing down.", session.Session)
 						tdRequest, _ := NewRequest("TEARDOWN", URL)
 						tdRequest.Headers["Session"] = session.Session
 						// Teardown отправляем асинхронно, так как сессия все равно умирает

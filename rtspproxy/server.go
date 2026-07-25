@@ -2,7 +2,6 @@ package rtspproxy
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"runtime"
 )
@@ -50,7 +49,7 @@ func (server *Server) LookupRemote(host, username, password string) *Remote {
 	}
 	remote := NewRemote(server, host, username, password)
 	if remote == nil {
-		log.Printf("Failed to connect to remote host: %s", host)
+		LogCriticalf("Failed to connect to remote host: %s", host)
 		return nil
 	}
 	server.remotes[host] = remote
@@ -80,7 +79,7 @@ func (server *Server) incomingConnectionHandler() {
 	for {
 		tcpConn, err := server.rtspListener.AcceptTCP()
 		if err != nil {
-			log.Printf("failed to accept client. %s", err.Error())
+			LogCriticalf("failed to accept client. %s", err.Error())
 			continue
 		}
 

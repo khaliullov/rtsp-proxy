@@ -2,7 +2,6 @@ package rtspproxy
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"net/url"
 	"path/filepath"
@@ -51,7 +50,7 @@ func NewClient(server *Server, socket net.Conn) *Client {
 	client.wg.Add(1)
 	go client.writer()
 
-	log.Printf("accepted the client connection [%s:%s].", client.remoteAddr, client.remotePort)
+	LogCriticalf("accepted the client connection [%s:%s].", client.remoteAddr, client.remotePort)
 	return client
 }
 
@@ -77,7 +76,7 @@ func (client *Client) Destroy() error {
 
 func (client *Client) incomingRequestHandler() {
 	defer func() {
-		log.Printf("disconnected the client connection [%s:%s].", client.remoteAddr, client.remotePort)
+		LogCriticalf("disconnected the client connection [%s:%s].", client.remoteAddr, client.remotePort)
 		client.Destroy()
 		if client.host != "" {
 			remote := client.server.LookupRemote(client.host, client.username, client.password)
@@ -94,7 +93,7 @@ func (client *Client) incomingRequestHandler() {
 		recvLen, err := client.ClientConn.Read(buffer[length:])
 		if err != nil {
 			if err.Error() != "EOF" {
-				log.Printf("Client read error [%s:%s]: %v", client.remoteAddr, client.remotePort, err)
+				LogCriticalf("Client read error [%s:%s]: %v", client.remoteAddr, client.remotePort, err)
 			}
 			return
 		}
@@ -152,11 +151,11 @@ func (client *Client) incomingRequestHandler() {
 		length = 0
 
 		// 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ СЫРОГО ЗАПРОСА
-		log.Printf("📩 RAW REQUEST from [%s:%s]:\n%s", client.remoteAddr, client.remotePort, reqStr)
+		Logf("📩 RAW REQUEST from [%s:%s]:\n%s", client.remoteAddr, client.remotePort, reqStr)
 
 		request, err := NewRequestFromBuffer(reqStr)
 		if err != nil {
-			log.Printf("❌ Failed to parse request: %v", err)
+			LogCriticalf("❌ Failed to parse request: %v", err)
 			return
 		}
 
@@ -202,7 +201,7 @@ func (client *Client) incomingRequestHandler() {
 				}
 			}
 
-			log.Printf("✅ Resolved client target: host=%s, path=%s, user=%s", client.host, request.URL.Path, client.username)
+			Logf("✅ Resolved client target: host=%s, path=%s, user=%s", client.host, request.URL.Path, client.username)
 		}
 
 		remote := client.server.LookupRemote(client.host, client.username, client.password)
@@ -216,7 +215,7 @@ func (client *Client) incomingRequestHandler() {
 		}
 
 		if remote == nil {
-			log.Printf("❌ Failed to create or find remote for host: %s", client.host)
+			LogCriticalf("❌ Failed to create or find remote for host: %s", client.host)
 			response := client.responseNotFound(request)
 			client.ClientConn.Write([]byte(response.String()))
 			return
@@ -231,7 +230,7 @@ func (client *Client) incomingRequestHandler() {
 		case "SETUP":
 			transport := client.getHeader(request, "Transport")
 			if transport != "" && strings.Contains(transport, "RTP/AVP") && !strings.Contains(transport, "RTP/AVP/TCP") {
-				log.Printf("⚠️ Client requested UDP (%s), but proxy only supports TCP. Sending 461 Unsupported Transport.", transport)
+				LogCriticalf("⚠️ Client requested UDP (%s), but proxy only supports TCP. Sending 461 Unsupported Transport.", transport)
 				response = client.responseUnsupportedTransport(request)
 			} else {
 				response = client.handleSetup(remote, request)
@@ -257,7 +256,7 @@ func (client *Client) incomingRequestHandler() {
 
 		// 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ СЫРОГО ОТВЕТА
 		respStr := response.String()
-		log.Printf("📤 RAW RESPONSE to [%s:%s]:\n%s", client.remoteAddr, client.remotePort, respStr)
+		Logf("📤 RAW RESPONSE to [%s:%s]:\n%s", client.remoteAddr, client.remotePort, respStr)
 
 		client.ClientConn.Write([]byte(respStr))
 	}
@@ -321,7 +320,7 @@ func (client *Client) handleOptions(remote *Remote, request *Request) *Response 
 	optionsRequest, _ := NewRequest("OPTIONS", URL)
 	err := remote.SendRequestSync(optionsRequest)
 	if err != nil {
-		log.Printf("⚠️ Error getting OPTIONS: %v", err)
+		LogCriticalf("⚠️ Error getting OPTIONS: %v", err)
 	}
 
 	response, _ := NewResponse(200, "OK")
@@ -340,7 +339,7 @@ func (client *Client) handleSetup(remote *Remote, request *Request) *Response {
 	transport := client.getHeader(request, "Transport")
 	ssrc, session, err := remote.GetSsrcSession(client, streamName, substreamName, transport)
 	if err != nil {
-		log.Printf("Error while setup %s/%s: %v", streamName, substreamName, err)
+		LogCriticalf("Error while setup %s/%s: %v", streamName, substreamName, err)
 		remote.Disconnect()
 		return client.responseBadRequest(request)
 	}
@@ -429,7 +428,7 @@ func (client *Client) handlePlay(remote *Remote, request *Request) *Response {
 	// Если Seq > 0 (второй клиент), он мгновенно вернет кэшированный RTP-Info, не дергая камеру.
 	rtpInfo, err := remote.GetRTPInfo(path, sessionID)
 	if err != nil {
-		log.Printf("⚠️ Error during PLAY for session %s: %v", sessionID, err)
+		LogCriticalf("⚠️ Error during PLAY for session %s: %v", sessionID, err)
 		remote.Disconnect()
 		return client.responseBadRequest(request)
 	}
