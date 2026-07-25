@@ -39,9 +39,9 @@ To run the proxy:
 -   **Interleaved Data Handling**: Properly processes and forwards interleaved RTP/RTCP binary data.
 -   **Robust Error Handling**: Enhanced logging and error recovery for client and remote connections.
 -   **Configurable Logging**: Added a `-verbose` flag to control logging verbosity.
+-   **Graceful Shutdown**: The server now handles OS signals (SIGINT, SIGTERM) to gracefully shut down, closing connections and cleaning up resources within a timeout.
 
 ## TODO
 
 -   Add support for UDP transport (currently only TCP interleaved is supported).
--   Implement more robust error handling and graceful shutdown.
 -   Consider adding support for other authentication schemes if needed.

@@ -46,9 +46,10 @@ func (remote *Remote) LookupStream(streamName string) *Stream {
 
 // NewRemote creates a new Remote instance.
 func NewRemote(server *Server, host, username, password string) *Remote {
+	Logf("DEBUG: NewRemote called with host: %q, username: %q", host, username)
 	addr, err := net.ResolveTCPAddr("tcp", host)
 	if err != nil {
-		LogCriticalf("Failed to resolve TCP address: %s", err.Error())
+		LogCriticalf("Failed to resolve TCP address for host %q: %s", host, err.Error())
 		return nil
 	}
 
@@ -65,6 +66,7 @@ func NewRemote(server *Server, host, username, password string) *Remote {
 		remote.digest.Username = username
 		remote.digest.Password = password
 	}
+	Logf("DEBUG: NewRemote created for host: %q", remote.Host)
 	// Connect on-demand: Dial() is no longer called here.
 	// It will be triggered by the first SendRequest.
 	return remote
@@ -72,30 +74,38 @@ func NewRemote(server *Server, host, username, password string) *Remote {
 
 // Dial establishes a connection to the remote RTSP server.
 func (remote *Remote) Dial() error {
-	timeout := 5
-	dialer := net.Dialer{Timeout: time.Duration(timeout) * time.Second}
-	socket, err := dialer.Dial("tcp", remote.Host)
-	if err != nil {
-		LogCriticalf("Failed to connect to the remote server: %s", err.Error())
-		return err
+	Logf("DEBUG: Dialing remote host: %q", remote.Host)
+	select {
+	case <-remote.Server.ctx.Done():
+		Logf("DEBUG: Server shutting down, aborting Dial to %q", remote.Host)
+		return errors.New("server is shutting down, cannot dial remote")
+	default:
+		timeout := 5
+		dialer := net.Dialer{Timeout: time.Duration(timeout) * time.Second}
+		socket, err := dialer.DialContext(remote.Server.ctx, "tcp", remote.Host)
+		if err != nil {
+			LogCriticalf("Failed to connect to the remote server %q: %s", remote.Host, err.Error())
+			return err
+		}
+
+		localAddr := strings.Split(socket.LocalAddr().String(), ":")
+		remoteAddr := strings.Split(socket.RemoteAddr().String(), ":")
+
+		if remote.RemoteConn != nil {
+			remote.RemoteConn.Close()
+		}
+		remote.RemoteConn, _ = socket.(*net.TCPConn)
+		remote.localAddr = localAddr[0]
+		remote.localPort = localAddr[1]
+		remote.remoteAddr = remoteAddr[0]
+		remote.remotePort = remoteAddr[1]
+		remote.currentCSeq = 0
+
+		remote.Server.remoteWg.Add(1)
+		go remote.incomingRequestHandler()
+		Logf("DEBUG: Successfully dialed remote host: %q", remote.Host)
+		return nil
 	}
-
-	localAddr := strings.Split(socket.LocalAddr().String(), ":")
-	remoteAddr := strings.Split(socket.RemoteAddr().String(), ":")
-
-	if remote.RemoteConn != nil {
-		remote.RemoteConn.Close()
-	}
-	remote.RemoteConn, _ = socket.(*net.TCPConn)
-	remote.localAddr = localAddr[0]
-	remote.localPort = localAddr[1]
-	remote.remoteAddr = remoteAddr[0]
-	remote.remotePort = remoteAddr[1]
-	remote.currentCSeq = 0
-
-	handler := remote.incomingRequestHandler
-	go handler()
-	return nil
 }
 
 // Disconnect closes the socket but keeps the Remote object alive for auto-reconnect.
@@ -154,11 +164,13 @@ func (remote *Remote) Destroy() error {
 func (remote *Remote) handleStream(tcpChannel, length int, dataBuffer []byte) {
 	interlayer := remote.interlayers[tcpChannel]
 	if interlayer == nil {
+		LogCriticalf("⚠️ handleStream: interlayer for channel %d is nil!", tcpChannel)
 		return
 	}
 
-	// Multi-client fanout: non-blocking write to each subscriber
+	count := 0
 	for e := interlayer.Subscribers.Front(); e != nil; e = e.Next() {
+		count++
 		subscriber := e.Value.(*Subscriber)
 		hdr := make([]byte, 4)
 		hdr[0] = '$'
@@ -172,13 +184,18 @@ func (remote *Remote) handleStream(tcpChannel, length int, dataBuffer []byte) {
 
 		select {
 		case subscriber.Client.writeChan <- packet:
+			Logf("✅ Sent packet to client %s on channel %d", subscriber.Client.remoteAddr, subscriber.Channel)
 		default:
 			LogCriticalf("Client write channel full, dropping packet for client %s", subscriber.Client.remoteAddr)
 		}
 	}
+	if count == 0 {
+		LogCriticalf("⚠️ handleStream: No subscribers for channel %d!", tcpChannel)
+	}
 }
 
 func (remote *Remote) incomingRequestHandler() {
+	defer remote.Server.remoteWg.Done()
 	defer func() {
 		if re := recover(); re != nil {
 			LogCriticalf("Remote Handle panic: %v", re)
@@ -191,131 +208,171 @@ func (remote *Remote) incomingRequestHandler() {
 	length := 0
 
 	for {
-		recvLen, err := remote.RemoteConn.Read(buffer[length:])
-		if err != nil {
+		select {
+		case <-remote.Server.ctx.Done():
+			Logf("Remote reader for [%s:%s] stopping due to server shutdown.", remote.remoteAddr, remote.remotePort)
 			return
-		}
-		length += recvLen
-
-		if buffer[0] == '$' {
-			for length < streamHeaderLength {
-				recvLen, err := remote.RemoteConn.Read(buffer[length:])
-				if err != nil {
-					return
-				}
-				length += recvLen
-			}
-
-			tcpChannel := int(buffer[1])
-			streamDataLength := ((int(buffer[2]) << 8) | int(buffer[3]))
-			streamDataRecvLength := length - streamHeaderLength
-
-			for streamDataRecvLength < streamDataLength {
-				recvLen, err := remote.RemoteConn.Read(buffer[length:])
-				if err != nil {
-					return
-				}
-				length += recvLen
-				streamDataRecvLength = length - streamHeaderLength
-			}
-
-			dataBuffer := make([]byte, streamDataLength)
-			copy(dataBuffer, buffer[streamHeaderLength:streamHeaderLength+streamDataLength])
-			length = copy(buffer, buffer[streamHeaderLength+streamDataLength:length])
-
-			// 🔥 НОВЫЙ ЛОГ: Показывает, что камера реально шлет данные
-			if tcpChannel == 0 { // 0 = RTP Video, 1 = RTCP Video
-				Logf("📦 [MEDIA] Received RTP video packet from camera, len: %d", streamDataLength)
-			}
-
-			remote.handleStream(tcpChannel, streamDataLength, dataBuffer)
-		} else {
-			eol := bytes.Index(buffer, []byte("$"))
-			if eol == -1 {
-				eol = length
-			}
-
-			recv := string(buffer[:eol])
-			if eol > 0 && eol != length {
-				length = copy(buffer, buffer[eol:length])
-			} else {
-				length = 0
-			}
-
-			// 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ СЫРОГО ОТВЕТА ОТ КАМЕРЫ
-			Logf("📥 RAW RESPONSE FROM CAMERA [%s]:\n%s", remote.Host, recv)
-
-			response, err := NewResponseFromBuffer(recv)
-			if err != nil {
-				LogCriticalf("remote rtsp read request error: %v", err)
+		default:
+			if remote.RemoteConn == nil {
+				Logf("Remote connection for [%s:%s] is nil, stopping reader.", remote.remoteAddr, remote.remotePort)
 				return
 			}
+			// Set a read deadline to allow checking the context
+			remote.RemoteConn.SetReadDeadline(time.Now().Add(time.Second))
+			n, err := remote.RemoteConn.Read(buffer[length:])
+			remote.RemoteConn.SetReadDeadline(time.Time{}) // Clear deadline
 
-			requestEl := remote.requests.Front()
-			if requestEl == nil {
-				LogCriticalf("⚠️ [QUEUE] Received response but queue is empty! Dropping.")
-				length = 0
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue // Timeout, check context again
+				}
+				if remote.Server.ctx.Err() != nil {
+					Logf("Remote reader for [%s:%s] stopping due to server shutdown.", remote.remoteAddr, remote.remotePort)
+					return
+				}
+				LogCriticalf("Remote read error [%s:%s]: %v", remote.remoteAddr, remote.remotePort, err)
+				return
+			}
+			length += n
+			if length == 0 {
 				continue
 			}
 
-			request := requestEl.Value.(*Request)
-
-			// 🔥 ВАЖНО: НЕ удаляем запрос из очереди сразу!
-			// Если это 401 и мы будем делать retry, запрос должен остаться в очереди,
-			// чтобы следующий ответ (200 OK) был сопоставлен с этим же запросом.
-
-			status := "ok"
-			if response.Code == 401 && request.Attempts == 0 {
-				if wwwAuthenticate, ok := response.Headers["WWW-Authenticate"]; ok {
-					if remote.digest.Username != "" && remote.digest.Password != "" && remote.handleAuthenticationFailure(wwwAuthenticate) {
-						request.Attempts++
-						Logf("🔑 [AUTH] Retrying with Digest auth (CSeq will be updated)...")
-						remote.SendRequest(request)
-						length = 0
-						continue // Возвращаемся в начало цикла, чтобы прочитать ОТВЕТ на retry. Запрос всё еще в очереди!
-					} else {
-						LogCriticalf("❌ [AUTH] Auth failed or missing credentials.")
-						status = "unauthorized"
+			if buffer[0] == '$' {
+				for length < streamHeaderLength {
+					recvLen, err := remote.RemoteConn.Read(buffer[length:])
+					if err != nil {
+						return
 					}
+					length += recvLen
 				}
+
+				tcpChannel := int(buffer[1])
+				streamDataLength := ((int(buffer[2]) << 8) | int(buffer[3]))
+				streamDataRecvLength := length - streamHeaderLength
+
+				for streamDataRecvLength < streamDataLength {
+					recvLen, err := remote.RemoteConn.Read(buffer[length:])
+					if err != nil {
+						return
+					}
+					length += recvLen
+					streamDataRecvLength = length - streamHeaderLength
+				}
+
+				dataBuffer := make([]byte, streamDataLength)
+				copy(dataBuffer, buffer[streamHeaderLength:streamHeaderLength+streamDataLength])
+
+				// 🔥 КРИТИЧЕСКИ ВАЖНО: Сдвигаем остаток данных в начало буфера
+				length = copy(buffer, buffer[streamHeaderLength+streamDataLength:length])
+
+				if tcpChannel == 0 {
+					Logf("📦 [MEDIA] Received RTP video packet from camera, len: %d", streamDataLength)
+				}
+
+				remote.handleStream(tcpChannel, streamDataLength, dataBuffer)
 			} else {
-				// 🔥 ПРОВЕРКА ОШИБОК: Если камера вернула 4xx или 5xx, считаем это ошибкой
-				if response.Code >= 400 {
-					status = fmt.Sprintf("error %d: %s", response.Code, response.Status)
-					LogCriticalf("⚠️ [RTSP] Camera returned error for %s: %s", request.Method, status)
+				// Handle RTSP messages
+				eol := bytes.Index(buffer[:length], []byte("\r\n\r\n")) // Look for end of headers
+				if eol == -1 {
+					// Not a full RTSP message yet, continue reading
+					continue
+				}
+				eol += 4 // Include the \r\n\r\n
+
+				// Check if there's a Content-Length header to determine if there's a body
+				headerPart := string(buffer[:eol])
+				contentLength := 0
+				contentLengthMatch := regexp.MustCompile(`(?i)\r\nContent-Length:\s*(\d+)\r\n`).FindStringSubmatch(headerPart)
+				if len(contentLengthMatch) > 1 {
+					contentLength, _ = strconv.Atoi(contentLengthMatch[1])
+				}
+
+				totalMessageLength := eol + contentLength
+
+				if length < totalMessageLength {
+					// Not a full message (headers + body) yet, continue reading
+					continue
+				}
+
+				recv := string(buffer[:totalMessageLength])
+
+				// Shift remaining bytes in buffer to the front
+				length = copy(buffer, buffer[totalMessageLength:length])
+
+				// 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ СЫРОГО ОТВЕТА ОТ КАМЕРЫ
+				Logf("📥 RAW RESPONSE FROM CAMERA [%s]:\n%s", remote.Host, recv)
+
+				response, err := NewResponseFromBuffer(recv)
+				if err != nil {
+					LogCriticalf("remote rtsp read request error: %v", err)
+					return
+				}
+
+				requestEl := remote.requests.Front()
+				if requestEl == nil {
+					LogCriticalf("⚠️ [QUEUE] Received response but queue is empty! Dropping.")
+					continue
+				}
+
+				request := requestEl.Value.(*Request)
+
+				// 🔥 ВАЖНО: НЕ удаляем запрос из очереди сразу!
+				// Если это 401 и мы будем делать retry, запрос должен остаться в очереди,
+				// чтобы следующий ответ (200 OK) был сопоставлен с этим же запросом.
+
+				status := "ok"
+				if response.Code == 401 && request.Attempts == 0 {
+					if wwwAuthenticate, ok := response.Headers["WWW-Authenticate"]; ok {
+						if remote.digest.Username != "" && remote.digest.Password != "" && remote.handleAuthenticationFailure(wwwAuthenticate) {
+							request.Attempts++
+							Logf("🔑 [AUTH] Retrying with Digest auth (CSeq will be updated)...")
+							remote.SendRequest(request)
+							continue // Возвращаемся в начало цикла, чтобы прочитать ОТВЕТ на retry. Запрос всё еще в очереди!
+						} else {
+							LogCriticalf("❌ [AUTH] Auth failed or missing credentials.")
+							status = "unauthorized"
+						}
+					}
 				} else {
-					switch request.Method {
-					case "OPTIONS":
-						remote.handleOptions(request, response)
-					case "DESCRIBE":
-						remote.handleDescribe(request, response)
-					case "SETUP":
-						remote.handleSetup(request, response)
-					case "PLAY":
-						remote.handlePlay(request, response)
-					case "TEARDOWN":
-						remote.handleTeardown(request, response)
+					// 🔥 ПРОВЕРКА ОШИБОК: Если камера вернула 4xx или 5xx, считаем это ошибкой
+					if response.Code >= 400 {
+						status = fmt.Sprintf("error %d: %s", response.Code, response.Status)
+						LogCriticalf("⚠️ [RTSP] Camera returned error for %s: %s", request.Method, status)
+					} else {
+						switch request.Method {
+						case "OPTIONS":
+							remote.handleOptions(request, response)
+						case "DESCRIBE":
+							remote.handleDescribe(request, response)
+						case "SETUP":
+							remote.handleSetup(request, response)
+						case "PLAY":
+							remote.handlePlay(request, response)
+						case "TEARDOWN":
+							remote.handleTeardown(request, response)
+						}
 					}
 				}
-			}
 
-			// 🔥 ТЕПЕРЬ удаляем запрос из очереди, так как он полностью обработан
-			remote.requests.Remove(requestEl)
+				// 🔥 ТЕПЕРЬ удаляем запрос из очереди, так как он полностью обработан
+				remote.requests.Remove(requestEl)
 
-			// Разблокируем ожидающий IPC-канал
-			// 🔥 БЕЗОПАСНАЯ ОТПРАВКА: защищаемся от паники "send on closed channel"
-			for e := request.Subscriptions.Front(); e != nil; e = e.Next() {
-				ch := e.Value.(chan string)
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							// Клиент уже отключился и закрыл канал, это нормально, просто игнорируем
-							Logf("⚠️ [IPC] Client disconnected before response (recovered from panic)")
-						}
+				// Разблокируем ожидающий IPC-канал
+				// 🔥 БЕЗОПАСНАЯ ОТПРАВКА: защищаемся от паники "send on closed channel"
+				for e := request.Subscriptions.Front(); e != nil; e = e.Next() {
+					ch := e.Value.(chan string)
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								// Клиент уже отключился и закрыл канал, это нормально, просто игнорируем
+								Logf("⚠️ [IPC] Client disconnected before response (recovered from panic)")
+							}
+						}()
+						ch <- status
 					}()
-					ch <- status
-				}()
-				request.Subscriptions.Remove(e)
+					request.Subscriptions.Remove(e)
+				}
 			}
 		}
 	}
@@ -477,10 +534,11 @@ func (remote *Remote) GetSsrcSession(client *Client, streamName, substreamName, 
 			transport.Substreams[0].Channel = index
 			transport.Substreams[1] = NewSubstream(transport, substreamName)
 			transport.Substreams[1].Channel = index + 1
-			remote.interlayers[index] = NewInterlayer(index, stream, transport, transport.Substreams[0])
-			remote.interlayers[index+1] = NewInterlayer(index, stream, transport, transport.Substreams[1])
 
-			// 🔥 КРИТИЧЕСКИ ВАЖНО: Добавляем ПЕРВОГО клиента в список рассылки!
+			// 🔥 ИСПРАВЛЕНИЕ: Первый аргумент должен быть index+1 для второго канала!
+			remote.interlayers[index] = NewInterlayer(index, stream, transport, transport.Substreams[0])
+			remote.interlayers[index+1] = NewInterlayer(index+1, stream, transport, transport.Substreams[1])
+
 			remote.interlayers[index].Subscribers.PushBack(NewSubscriber(client, index))
 			remote.interlayers[index+1].Subscribers.PushBack(NewSubscriber(client, index+1))
 		} else {
@@ -549,8 +607,7 @@ func (remote *Remote) GetRTPInfo(streamName, sessionID string) (string, error) {
 		return "", errors.New("no streams were setup")
 	}
 
-	// 🔥 УМНАЯ ПРОВЕРКА: Если Seq == 0, значит PLAY еще не отправлялся (первый клиент).
-	// Отправляем PLAY камере, чтобы она начала стриминг.
+	// Отправляем PLAY камере, если это первый клиент
 	transport := transports.Front().Value.(*Transport)
 	if transport.Substreams[0].Channel >= 0 && transport.Substreams[0].Seq == 0 {
 		URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: streamName}
@@ -564,7 +621,7 @@ func (remote *Remote) GetRTPInfo(streamName, sessionID string) (string, error) {
 		}
 	}
 
-	// Генерируем RTP-Info на основе актуальных данных сессии
+	// Генерируем RTP-Info на основе тех данных, что реально вернула камера (даже если это 0)
 	parts := make([]string, session.Transports.Len())
 	i := 0
 	for e := session.Transports.Front(); e != nil; e = e.Next() {
@@ -602,6 +659,14 @@ func (remote *Remote) SendRequestSync(request *Request) error {
 
 		result := ipc.GetResponse()
 
+		// If server is shutting down, return immediately
+		select {
+		case <-remote.Server.ctx.Done():
+			return errors.New("server is shutting down, request aborted")
+		default:
+			// continue
+		}
+
 		// Если произошел таймаут и это первая попытка
 		if result == "timeout" && attempt == 0 {
 			Logf("⚠️ [AUTH] Request timed out (camera silently dropped stale nonce). Clearing nonce and retrying...")
@@ -622,38 +687,43 @@ func (remote *Remote) SendRequestSync(request *Request) error {
 
 // SendRequest sends an RTSP request to the remote server.
 func (remote *Remote) SendRequest(request *Request) error {
-	remote.connMutex.Lock()
-	if remote.RemoteConn == nil {
-		err := remote.Dial()
+	select {
+	case <-remote.Server.ctx.Done():
+		return errors.New("server is shutting down, cannot send request")
+	default:
+		remote.connMutex.Lock()
+		if remote.RemoteConn == nil {
+			err := remote.Dial()
+			if err != nil {
+				remote.connMutex.Unlock()
+				return err
+			}
+		}
+		conn := remote.RemoteConn
+		remote.connMutex.Unlock()
+
+		remote.currentCSeq++
+		request.Headers["CSeq"] = strconv.Itoa(remote.currentCSeq)
+
+		// 🔥 ОТЛАДКА: Печатаем состояние аутентификации прямо перед отправкой
+		Logf("🔍 [AUTH STATE] Method: %s, User: %q, Pass: %q, Realm: %q, Nonce: %q",
+			request.Method, remote.digest.Username, remote.digest.Password, remote.digest.Realm, remote.digest.Nonce)
+
+		remote.createAuthenticatorStr(request)
+
+		rawRequest := []byte(request.String())
+		Logf("📤 RAW REQUEST TO CAMERA [%s]:\n%s", remote.Host, string(rawRequest))
+
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_, err := conn.Write(rawRequest)
 		if err != nil {
-			remote.connMutex.Unlock()
+			LogCriticalf("Failed to write to remote: %v", err)
+			remote.Disconnect()
 			return err
 		}
+		conn.SetWriteDeadline(time.Time{})
+		return nil
 	}
-	conn := remote.RemoteConn
-	remote.connMutex.Unlock()
-
-	remote.currentCSeq++
-	request.Headers["CSeq"] = strconv.Itoa(remote.currentCSeq)
-
-	// 🔥 ОТЛАДКА: Печатаем состояние аутентификации прямо перед отправкой
-	Logf("🔍 [AUTH STATE] Method: %s, User: %q, Pass: %q, Realm: %q, Nonce: %q",
-		request.Method, remote.digest.Username, remote.digest.Password, remote.digest.Realm, remote.digest.Nonce)
-
-	remote.createAuthenticatorStr(request)
-
-	rawRequest := []byte(request.String())
-	Logf("📤 RAW REQUEST TO CAMERA [%s]:\n%s", remote.Host, string(rawRequest))
-
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	_, err := conn.Write(rawRequest)
-	if err != nil {
-		LogCriticalf("Failed to write to remote: %v", err)
-		remote.Disconnect()
-		return err
-	}
-	conn.SetWriteDeadline(time.Time{})
-	return nil
 }
 
 // SendBinary forwards interleaved RTP/RTCP data from client to remote
@@ -661,6 +731,7 @@ func (remote *Remote) SendBinary(channel int, data []byte) error {
 	remote.connMutex.Lock()
 	if remote.RemoteConn == nil {
 		remote.connMutex.Unlock()
+		LogCriticalf("⚠️ SendBinary failed: remote connection is closed")
 		return errors.New("remote connection is closed")
 	}
 	conn := remote.RemoteConn
@@ -676,13 +747,17 @@ func (remote *Remote) SendBinary(channel int, data []byte) error {
 	_, err := conn.Write(header)
 	if err != nil {
 		conn.SetWriteDeadline(time.Time{})
+		LogCriticalf("⚠️ SendBinary header failed: %v", err)
 		remote.Disconnect()
 		return err
 	}
 	_, err = conn.Write(data)
 	conn.SetWriteDeadline(time.Time{})
 	if err != nil {
+		LogCriticalf("⚠️ SendBinary data failed: %v", err)
 		remote.Disconnect()
+	} else {
+		Logf("✅ Successfully sent binary data to camera on channel %d, len %d", channel, len(data))
 	}
 	return err
 }

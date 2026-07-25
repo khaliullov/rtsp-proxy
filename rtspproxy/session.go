@@ -70,7 +70,6 @@ func (session *Session) Start() {
 		session.quit = make(chan struct{})
 
 		go func() {
-			// 🔥 ЗАЩИТА ОТ ПАНИКИ: recover ловит любые падения внутри горутины
 			defer func() {
 				if r := recover(); r != nil {
 					LogCriticalf("⚠️ [SESSION] Keep-alive panic recovered for session %s: %v", session.Session, r)
@@ -83,8 +82,6 @@ func (session *Session) Start() {
 				select {
 				case <-ticker.C:
 					remote := session.Stream.Remote
-
-					// 🔥 ПРОВЕРКА: Если Remote уже уничтожен или отключен, выходим
 					if remote == nil {
 						LogCriticalf("⚠️ [SESSION] Remote is nil, stopping keep-alive for session %s", session.Session)
 						return
@@ -94,7 +91,6 @@ func (session *Session) Start() {
 					request, _ := NewRequest("GET_PARAMETER", URL)
 					request.Headers["Session"] = session.Session
 
-					// 🔥 ОБРАБОТКА ОШИБОК: Если keep-alive не прошел, сессия, скорее всего, мертва
 					err := remote.SendRequestSync(request)
 					if err != nil {
 						LogCriticalf("⚠️ [SESSION] Keep-alive failed for session %s: %v. Stopping.", session.Session, err)
@@ -102,7 +98,6 @@ func (session *Session) Start() {
 					}
 
 					subscribers := 0
-					// Безопасный подсчет подписчиков с проверкой наличия ключей в map
 					for e := session.Transports.Front(); e != nil; e = e.Next() {
 						transport := e.Value.(*Transport)
 						if interlayer, ok := remote.interlayers[transport.Substreams[0].Channel]; ok {
@@ -123,7 +118,6 @@ func (session *Session) Start() {
 						LogCriticalf("No subscribers for a long time for session %s. Tearing down.", session.Session)
 						tdRequest, _ := NewRequest("TEARDOWN", URL)
 						tdRequest.Headers["Session"] = session.Session
-						// Teardown отправляем асинхронно, так как сессия все равно умирает
 						go remote.SendRequest(tdRequest)
 						return
 					}

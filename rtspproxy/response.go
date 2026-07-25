@@ -52,11 +52,14 @@ func (response *Response) getLine(startOfLine string) (thisLineStart, nextLineSt
 		// Check for the end of line: \r\n (but also accept \r or \n by itself):
 		if c == '\r' || c == '\n' {
 			if c == '\r' {
-				if startOfLine[i+1] == '\n' {
+				// 🔥 ИСПРАВЛЕНИЕ: Проверка границ перед доступом к i+1
+				if i+1 < len(startOfLine) && startOfLine[i+1] == '\n' {
 					index = i + 2 // skip "\r\n"
+				} else {
+					index = i + 1 // skip "\r"
 				}
 			} else {
-				index = i + 1
+				index = i + 1 // skip "\n"
 			}
 
 			thisLineStart = startOfLine[:i]

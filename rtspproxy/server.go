@@ -1,23 +1,37 @@
 package rtspproxy
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"runtime"
+	"strings"
+	"sync"
+	"time"
 )
 
 // Server represents the RTSP proxy server.
 type Server struct {
+	ctx          context.Context
+	cancel       context.CancelFunc
 	rtspPort     int
 	rtspListener *net.TCPListener
 	remotes      map[string]*Remote
+	clients      sync.WaitGroup // To track active client connections
+	remoteWg     sync.WaitGroup // To track active remote connections
+	mu           sync.Mutex     // Mutex for remotes map
 }
 
 // NewServer creates a new Server instance.
-func NewServer() *Server {
+func NewServer(ctx context.Context) *Server {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	return &Server{remotes: make(map[string]*Remote)}
+	serverCtx, cancel := context.WithCancel(ctx)
+	return &Server{
+		ctx:     serverCtx,
+		cancel:  cancel,
+		remotes: make(map[string]*Remote),
+	}
 }
 
 // Listen starts the server listening on the specified port.
@@ -26,30 +40,93 @@ func (server *Server) Listen(portNum int) error {
 
 	var err error
 	server.rtspListener, err = server.setupOurSocket()
-
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to setup socket: %w", err)
+	}
+	return nil
 }
 
 func (server *Server) setupOurSocket() (*net.TCPListener, error) {
 	tcpAddr := fmt.Sprintf("0.0.0.0:%d", server.rtspPort)
-	addr, _ := net.ResolveTCPAddr("tcp", tcpAddr)
+	addr, err := net.ResolveTCPAddr("tcp", tcpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve TCP address: %w", err)
+	}
 
-	return net.ListenTCP("tcp", addr)
+	listener, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on TCP: %w", err)
+	}
+	return listener, nil
 }
 
-// Destroy closes the server's listener.
-func (server *Server) Destroy() {
-	server.rtspListener.Close()
+// Shutdown gracefully shuts down the server.
+func (server *Server) Shutdown(ctx context.Context) error {
+	LogCriticalf("Initiating server shutdown...")
+
+	// 1. Stop accepting new connections
+	if server.rtspListener != nil {
+		if err := server.rtspListener.Close(); err != nil {
+			LogCriticalf("Error closing RTSP listener: %v", err)
+		}
+	}
+
+	// 2. Signal all goroutines to stop
+	server.cancel()
+
+	// 3. Wait for all clients to finish
+	done := make(chan struct{})
+	go func() {
+		server.clients.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		LogCriticalf("All client connections closed.")
+	case <-ctx.Done():
+		LogCriticalf("Shutdown context timed out while waiting for clients to close.")
+		return ctx.Err()
+	}
+
+	// 4. Disconnect all remotes
+	server.mu.Lock()
+	for host, remote := range server.remotes {
+		Logf("Disconnecting remote: %s", host)
+		remote.Disconnect() // This will also stop sessions and clean up
+	}
+	server.mu.Unlock()
+
+	// Wait for all remote-related goroutines to finish
+	remoteDone := make(chan struct{})
+	go func() {
+		server.remoteWg.Wait()
+		close(remoteDone)
+	}()
+
+	select {
+	case <-remoteDone:
+		LogCriticalf("All remote connections closed.")
+	case <-ctx.Done():
+		LogCriticalf("Shutdown context timed out while waiting for remotes to close.")
+		return ctx.Err()
+	}
+
+	LogCriticalf("Server shutdown complete.")
+	return nil
 }
 
 // LookupRemote retrieves an existing remote connection or creates a new one.
 func (server *Server) LookupRemote(host, username, password string) *Remote {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+
 	if remote, ok := server.remotes[host]; ok {
 		return remote
 	}
 	remote := NewRemote(server, host, username, password)
 	if remote == nil {
-		LogCriticalf("Failed to connect to remote host: %s", host)
+		LogCriticalf("Failed to create remote for host: %s", host)
 		return nil
 	}
 	server.remotes[host] = remote
@@ -58,34 +135,55 @@ func (server *Server) LookupRemote(host, username, password string) *Remote {
 
 // RemoveRemote removes a remote connection from the server's management.
 func (server *Server) RemoveRemote(host string) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
 	if _, ok := server.remotes[host]; ok {
 		delete(server.remotes, host)
+		Logf("Removed remote: %s", host)
 	}
 }
 
 // Start begins accepting incoming client connections.
 func (server *Server) Start() {
-	go server.incomingConnectionHandler()
+	server.incomingConnectionHandler()
 }
 
 func (server *Server) newClientConnection(conn net.Conn) {
-	client := NewClient(server, conn)
-	if client != nil {
-		client.incomingRequestHandler()
-	}
+	server.clients.Add(1)
+	go func() {
+		defer server.clients.Done()
+		client := NewClient(server, conn)
+		if client != nil {
+			client.incomingRequestHandler()
+		}
+	}()
 }
 
 func (server *Server) incomingConnectionHandler() {
 	for {
-		tcpConn, err := server.rtspListener.AcceptTCP()
-		if err != nil {
-			LogCriticalf("failed to accept client. %s", err.Error())
-			continue
+		select {
+		case <-server.ctx.Done():
+			LogCriticalf("Stopping incoming connection handler due to shutdown signal.")
+			return
+		default:
+			if server.rtspListener != nil {
+				server.rtspListener.SetDeadline(time.Now().Add(time.Second))
+			}
+			tcpConn, err := server.rtspListener.AcceptTCP()
+			if err != nil {
+				// 🔥 ИСПРАВЛЕНИЕ: Тихий выход при закрытии слушателя
+				if server.ctx.Err() != nil || strings.Contains(err.Error(), "closed network connection") {
+					return
+				}
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue // Timeout, check context again
+				}
+				LogCriticalf("Failed to accept client: %s", err.Error())
+				continue
+			}
+
+			tcpConn.SetReadBuffer(50 * 1024)
+			server.newClientConnection(tcpConn)
 		}
-
-		tcpConn.SetReadBuffer(50 * 1024)
-
-		// Create a new object for handling server RTSP connection:
-		go server.newClientConnection(tcpConn)
 	}
 }

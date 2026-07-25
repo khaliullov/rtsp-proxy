@@ -56,18 +56,30 @@ func NewClient(server *Server, socket net.Conn) *Client {
 
 func (client *Client) writer() {
 	defer client.wg.Done()
-	for data := range client.writeChan {
-		client.ClientConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		_, err := client.ClientConn.Write(data)
-		client.ClientConn.SetWriteDeadline(time.Time{})
-		if err != nil {
+	for {
+		select {
+		case <-client.server.ctx.Done():
+			Logf("Client writer for [%s:%s] stopping due to server shutdown.", client.remoteAddr, client.remotePort)
 			return
+		case data, ok := <-client.writeChan:
+			if !ok {
+				Logf("Client writer for [%s:%s] stopping, write channel closed.", client.remoteAddr, client.remotePort)
+				return
+			}
+			client.ClientConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, err := client.ClientConn.Write(data)
+			client.ClientConn.SetWriteDeadline(time.Time{})
+			if err != nil {
+				LogCriticalf("Client write error [%s:%s]: %v", client.remoteAddr, client.remotePort, err)
+				return
+			}
 		}
 	}
 }
 
 // Destroy closes the client connection and cleans up resources.
 func (client *Client) Destroy() error {
+	Logf("Destroying client connection [%s:%s].", client.remoteAddr, client.remotePort)
 	client.ClientConn.Close() // Unblock writer and reader
 	close(client.writeChan)
 	client.wg.Wait()
@@ -90,175 +102,213 @@ func (client *Client) incomingRequestHandler() {
 	length := 0
 
 	for {
-		recvLen, err := client.ClientConn.Read(buffer[length:])
-		if err != nil {
-			if err.Error() != "EOF" {
-				LogCriticalf("Client read error [%s:%s]: %v", client.remoteAddr, client.remotePort, err)
-			}
+		select {
+		case <-client.server.ctx.Done():
+			Logf("Client reader for [%s:%s] stopping due to server shutdown.", client.remoteAddr, client.remotePort)
 			return
-		}
-		length += recvLen
-		if length == 0 {
-			continue
-		}
+		default:
+			// Set a read deadline to allow checking the context
+			client.ClientConn.SetReadDeadline(time.Now().Add(time.Second))
+			recvLen, err := client.ClientConn.Read(buffer[length:])
+			client.ClientConn.SetReadDeadline(time.Time{}) // Clear deadline
 
-		if buffer[0] == '$' {
-			// Process interleaved binary data (RTP/RTCP from client)
-			for length < streamHeaderLength {
-				recvLen, err := client.ClientConn.Read(buffer[length:])
-				if err != nil {
-					return
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue // Timeout, check context again
 				}
-				length += recvLen
+				if err.Error() != "EOF" {
+					LogCriticalf("Client read error [%s:%s]: %v", client.remoteAddr, client.remotePort, err)
+				}
+				return
+			}
+			length += recvLen
+			if length == 0 {
+				continue
 			}
 
-			tcpChannel := int(buffer[1])
-			streamDataLength := ((int(buffer[2]) << 8) | int(buffer[3]))
-			streamDataRecvLength := length - streamHeaderLength
-
-			for streamDataRecvLength < streamDataLength {
-				recvLen, err := client.ClientConn.Read(buffer[length:])
-				if err != nil {
-					return
+			if buffer[0] == '$' {
+				// Process interleaved binary data (RTP/RTCP from client)
+				for length < streamHeaderLength {
+					select {
+					case <-client.server.ctx.Done():
+						Logf("Client reader for [%s:%s] stopping during stream header read due to server shutdown.", client.remoteAddr, client.remotePort)
+						return
+					default:
+						client.ClientConn.SetReadDeadline(time.Now().Add(time.Second))
+						recvLen, err := client.ClientConn.Read(buffer[length:])
+						client.ClientConn.SetReadDeadline(time.Time{})
+						if err != nil {
+							if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+								continue
+							}
+							LogCriticalf("Client read error during stream header [%s:%s]: %v", client.remoteAddr, client.remotePort, err)
+							return
+						}
+						length += recvLen
+					}
 				}
-				length += recvLen
-				streamDataRecvLength = length - streamHeaderLength
-			}
 
-			dataBuffer := make([]byte, streamDataLength)
-			copy(dataBuffer, buffer[streamHeaderLength:streamHeaderLength+streamDataLength])
-			length = copy(buffer, buffer[streamHeaderLength+streamDataLength:length])
+				tcpChannel := int(buffer[1])
+				streamDataLength := ((int(buffer[2]) << 8) | int(buffer[3]))
+				streamDataRecvLength := length - streamHeaderLength
 
-			if client.host != "" {
-				remote := client.server.LookupRemote(client.host, client.username, client.password)
-				if remote != nil {
-					var remoteChannel int = tcpChannel
-					for ch, interlayer := range remote.interlayers {
-						for e := interlayer.Subscribers.Front(); e != nil; e = e.Next() {
-							if e.Value.(*Subscriber).Client == client && e.Value.(*Subscriber).Channel == tcpChannel {
-								remoteChannel = ch
-								break
+				for streamDataRecvLength < streamDataLength {
+					select {
+					case <-client.server.ctx.Done():
+						Logf("Client reader for [%s:%s] stopping during stream data read due to server shutdown.", client.remoteAddr, client.remotePort)
+						return
+					default:
+						client.ClientConn.SetReadDeadline(time.Now().Add(time.Second))
+						recvLen, err := client.ClientConn.Read(buffer[length:])
+						client.ClientConn.SetReadDeadline(time.Time{})
+						if err != nil {
+							if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+								continue
+							}
+							LogCriticalf("Client read error during stream data [%s:%s]: %v", client.remoteAddr, client.remotePort, err)
+							return
+						}
+						length += recvLen
+						streamDataRecvLength = length - streamHeaderLength
+					}
+				}
+
+				dataBuffer := make([]byte, streamDataLength)
+				copy(dataBuffer, buffer[streamHeaderLength:streamHeaderLength+streamDataLength])
+				length = copy(buffer, buffer[streamHeaderLength+streamDataLength:length])
+
+				if client.host != "" {
+					remote := client.server.LookupRemote(client.host, client.username, client.password)
+					if remote != nil {
+						var remoteChannel int = tcpChannel
+						for ch, interlayer := range remote.interlayers {
+							for e := interlayer.Subscribers.Front(); e != nil; e = e.Next() {
+								if e.Value.(*Subscriber).Client == client && e.Value.(*Subscriber).Channel == tcpChannel {
+									remoteChannel = ch
+									break
+								}
 							}
 						}
+						Logf("📥 Received binary data from client on channel %d, forwarding to remote channel %d, len %d", tcpChannel, remoteChannel, streamDataLength)
+						go remote.SendBinary(remoteChannel, dataBuffer)
 					}
-					go remote.SendBinary(remoteChannel, dataBuffer)
 				}
+				continue
 			}
-			continue
-		}
 
-		reqStr := string(buffer[:length])
-		length = 0
+			reqStr := string(buffer[:length])
+			length = 0
 
-		// 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ СЫРОГО ЗАПРОСА
-		Logf("📩 RAW REQUEST from [%s:%s]:\n%s", client.remoteAddr, client.remotePort, reqStr)
+			// 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ СЫРОГО ЗАПРОСА
+			Logf("📩 RAW REQUEST from [%s:%s]:\n%s", client.remoteAddr, client.remotePort, reqStr)
 
-		request, err := NewRequestFromBuffer(reqStr)
-		if err != nil {
-			LogCriticalf("❌ Failed to parse request: %v", err)
-			return
-		}
+			request, err := NewRequestFromBuffer(reqStr)
+			if err != nil {
+				LogCriticalf("❌ Failed to parse request: %v", err)
+				return
+			}
+			Logf("DEBUG: Client received request with URL: %+v", request.URL)
 
-		if client.host == "" {
-			client.username = request.URL.User.Username()
-			client.password, _ = request.URL.User.Password()
+			if client.host == "" {
+				client.username = request.URL.User.Username()
+				client.password, _ = request.URL.User.Password()
 
-			trimmedPath := strings.TrimPrefix(request.URL.Path, "/")
-			parts := strings.SplitN(trimmedPath, "/", 3)
+				trimmedPath := strings.TrimPrefix(request.URL.Path, "/")
+				parts := strings.SplitN(trimmedPath, "/", 3)
 
-			if len(parts) >= 2 {
-				if parts[0] == "rtsp" {
+				if len(parts) >= 2 && parts[0] == "rtsp" {
 					client.host = parts[1]
 					if len(parts) == 3 {
 						request.URL.Path = "/" + parts[2]
 					} else {
 						request.URL.Path = "/"
 					}
-				} else if strings.Contains(parts[0], ":") {
-					client.host = parts[0]
-					if len(parts) >= 2 {
-						request.URL.Path = "/" + parts[1]
-						if len(parts) == 3 {
-							request.URL.Path += "/" + parts[2]
-						}
-					} else {
-						request.URL.Path = "/"
-					}
 				} else {
+					// 🔥 ЗАЩИТА: Если клиент стучится в корень прокси (OPTIONS * или /),
+					// отвечаем возможностями прокси, НЕ подключаясь к 127.0.0.1!
+					if request.Method == "OPTIONS" && (request.URL.Path == "*" || request.URL.Path == "/" || request.URL.Path == "") {
+						LogCriticalf("Client probing proxy directly. Responding with proxy capabilities.")
+						response, _ := NewResponse(200, "OK")
+						response.Headers["Public"] = "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER"
+						response.Headers["Server"] = "RTSP-Proxy/1.0"
+						response.Headers["CSeq"] = client.getHeader(request, "CSeq")
+						client.ClientConn.Write([]byte(response.String()))
+						return // Завершаем обработку этого запроса
+					}
 					client.host = request.URL.Host
 				}
-			} else {
-				client.host = request.URL.Host
-			}
 
-			if strings.Contains(client.host, "@") {
-				authAndHost := strings.SplitN(client.host, "@", 2)
-				client.host = authAndHost[1]
-				authParts := strings.SplitN(authAndHost[0], ":", 2)
-				if len(authParts) == 2 {
-					client.username = authParts[0]
-					client.password = authParts[1]
+				if strings.Contains(client.host, "@") {
+					authAndHost := strings.SplitN(client.host, "@", 2)
+					client.host = authAndHost[1]
+					authParts := strings.SplitN(authAndHost[0], ":", 2)
+					if len(authParts) == 2 {
+						client.username = authParts[0]
+						client.password = authParts[1]
+					}
 				}
+
+				// 🔥 LogCriticalf вместо Logf, чтобы видеть это без флага -verbose
+				LogCriticalf("✅ Resolved client target: host=%s, path=%s, user=%s", client.host, request.URL.Path, client.username)
 			}
 
-			Logf("✅ Resolved client target: host=%s, path=%s, user=%s", client.host, request.URL.Path, client.username)
-		}
+			remote := client.server.LookupRemote(client.host, client.username, client.password)
+			Logf("DEBUG: LookupRemote called with host: %s, username: %s, password: %s", client.host, client.username, client.password)
 
-		remote := client.server.LookupRemote(client.host, client.username, client.password)
-
-		// 🔥 ГАРАНТИЯ АУТЕНТИФИКАЦИИ:
-		// Принудительно обновляем учетные данные в объекте Remote,
-		// чтобы механизм Digest-аутентификации точно сработал.
-		if client.username != "" && client.password != "" {
-			remote.digest.Username = client.username
-			remote.digest.Password = client.password
-		}
-
-		if remote == nil {
-			LogCriticalf("❌ Failed to create or find remote for host: %s", client.host)
-			response := client.responseNotFound(request)
-			client.ClientConn.Write([]byte(response.String()))
-			return
-		}
-
-		response := client.responseBadRequest(request)
-		switch request.Method {
-		case "OPTIONS":
-			response = client.handleOptions(remote, request)
-		case "DESCRIBE":
-			response = client.handleDescribe(remote, request)
-		case "SETUP":
-			transport := client.getHeader(request, "Transport")
-			if transport != "" && strings.Contains(transport, "RTP/AVP") && !strings.Contains(transport, "RTP/AVP/TCP") {
-				LogCriticalf("⚠️ Client requested UDP (%s), but proxy only supports TCP. Sending 461 Unsupported Transport.", transport)
-				response = client.responseUnsupportedTransport(request)
-			} else {
-				response = client.handleSetup(remote, request)
+			// 🔥 ГАРАНТИЯ АУТЕНТИФИКАЦИИ:
+			// Принудительно обновляем учетные данные в объекте Remote,
+			// чтобы механизм Digest-аутентификации точно сработал.
+			if client.username != "" && client.password != "" {
+				remote.digest.Username = client.username
+				remote.digest.Password = client.password
 			}
-		case "PLAY":
-			response = client.handlePlay(remote, request)
-		case "TEARDOWN":
-			response = client.handleTeardown(remote, request)
-		case "GET_PARAMETER":
-			response = client.handleGetParameter(remote, request)
+
+			if remote == nil {
+				LogCriticalf("❌ Failed to create or find remote for host: %s", client.host)
+				response := client.responseNotFound(request)
+				client.ClientConn.Write([]byte(response.String()))
+				return
+			}
+
+			response := client.responseBadRequest(request)
+			switch request.Method {
+			case "OPTIONS":
+				response = client.handleOptions(remote, request)
+			case "DESCRIBE":
+				response = client.handleDescribe(remote, request)
+			case "SETUP":
+				transport := client.getHeader(request, "Transport")
+				if transport != "" && strings.Contains(transport, "RTP/AVP") && !strings.Contains(transport, "RTP/AVP/TCP") {
+					LogCriticalf("⚠️ Client requested UDP (%s), but proxy only supports TCP. Sending 461 Unsupported Transport.", transport)
+					response = client.responseUnsupportedTransport(request)
+				} else {
+					response = client.handleSetup(remote, request)
+				}
+			case "PLAY":
+				response = client.handlePlay(remote, request)
+			case "TEARDOWN":
+				response = client.handleTeardown(remote, request)
+			case "GET_PARAMETER":
+				response = client.handleGetParameter(remote, request)
+			}
+
+			response.Headers["Via"] = "RTSP-Proxy"
+			cseq := client.getHeader(request, "CSeq")
+			if cseq != "" {
+				response.Headers["CSeq"] = cseq
+			}
+
+			// 🛡️ ИСПРАВЛЕНИЕ: VLC не любит пустой заголовок Server
+			if server, ok := response.Headers["Server"]; !ok || server == "" {
+				response.Headers["Server"] = "RTSP-Proxy/1.0"
+			}
+
+			// 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ СЫРОГО ОТВЕТА
+			respStr := response.String()
+			Logf("📤 RAW RESPONSE to [%s:%s]:\n%s", client.remoteAddr, client.remotePort, respStr)
+
+			client.ClientConn.Write([]byte(respStr))
 		}
-
-		response.Headers["Via"] = "RTSP-Proxy"
-		cseq := client.getHeader(request, "CSeq")
-		if cseq != "" {
-			response.Headers["CSeq"] = cseq
-		}
-
-		// 🛡️ ИСПРАВЛЕНИЕ: VLC не любит пустой заголовок Server
-		if server, ok := response.Headers["Server"]; !ok || server == "" {
-			response.Headers["Server"] = "RTSP-Proxy/1.0"
-		}
-
-		// 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ СЫРОГО ОТВЕТА
-		respStr := response.String()
-		Logf("📤 RAW RESPONSE to [%s:%s]:\n%s", client.remoteAddr, client.remotePort, respStr)
-
-		client.ClientConn.Write([]byte(respStr))
 	}
 }
 

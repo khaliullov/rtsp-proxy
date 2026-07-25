@@ -49,6 +49,7 @@ func NewRequestFromBuffer(buffer string) (*Request, error) {
 			return nil, err
 		}
 	}
+	Logf("DEBUG: NewRequestFromBuffer created request.URL: %+v", request.URL)
 	return request, nil
 }
 
@@ -58,11 +59,14 @@ func (request *Request) getLine(startOfLine string) (thisLineStart, nextLineStar
 		// Check for the end of line: \r\n (but also accept \r or \n by itself):
 		if c == '\r' || c == '\n' {
 			if c == '\r' {
-				if startOfLine[i+1] == '\n' {
+				// 🔥 ИСПРАВЛЕНИЕ: Проверка границ перед доступом к i+1
+				if i+1 < len(startOfLine) && startOfLine[i+1] == '\n' {
 					index = i + 2 // skip "\r\n"
+				} else {
+					index = i + 1 // skip "\r"
 				}
 			} else {
-				index = i + 1
+				index = i + 1 // skip "\n"
 			}
 
 			thisLineStart = startOfLine[:i]
@@ -96,12 +100,15 @@ func (request *Request) ParseCommand(buffer string) error {
 	}
 	re := regexp.MustCompile(`^rtsp:\/\/[^:\/]+(:?[:]\d+)?\/(rtsp)\/(.*)`)
 	rawURL := re.ReplaceAllString(request.RawURL, "$2://$3")
+	Logf("DEBUG: ParseCommand rawURL after regex: %q", rawURL)
 	var err error
 	URL, err := url.Parse(rawURL)
 	if err != nil {
+		LogCriticalf("Failed to parse URL %q: %v", rawURL, err)
 		return err
 	}
 	request.URL = URL
+	Logf("DEBUG: ParseCommand parsed request.URL: %+v", request.URL)
 	return nil
 }
 
