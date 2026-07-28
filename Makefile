@@ -6,7 +6,7 @@ PORT   := 8554
 packages = $$(go list ./... | egrep -v '/vendor/' | egrep -v '/cmd/')
 files = $$(find . -name '*.go' | egrep -v '/vendor/' | egrep -v '/cmd/')
 
-.PHONY: all help run vet lint build install
+.PHONY: all help run vet lint build install test
 
 all: build
 
@@ -42,3 +42,6 @@ $(GODEP):
 $(GOLINT):
 	cd $(GOPATH) && go get -u golang.org/x/lint/golint
 	cd $(GOPATH) && go get -u github.com/golang/lint/golint
+
+test:
+	go test -v ./rtspproxy/...

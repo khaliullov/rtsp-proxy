@@ -58,8 +58,8 @@ func (session *Session) Stop() {
 	}
 }
 
-// Start begins the session's keep-alive mechanism.
-func (session *Session) Start() {
+// StartUpstream begins the session's keep-alive mechanism without checking for subscribers.
+func (session *Session) StartUpstream() {
 	timeout := session.Timeout - 5
 	if timeout < 0 {
 		timeout = 1
@@ -70,58 +70,21 @@ func (session *Session) Start() {
 		session.quit = make(chan struct{})
 
 		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					LogCriticalf("⚠️ [SESSION] Keep-alive panic recovered for session %s: %v", session.Session, r)
-				}
-				ticker.Stop()
-				session.started = false
-			}()
+			defer ticker.Stop()
+			defer func() { session.started = false }()
 
 			for {
 				select {
 				case <-ticker.C:
-					remote := session.Stream.Remote
-					if remote == nil {
-						LogCriticalf("⚠️ [SESSION] Remote is nil, stopping keep-alive for session %s", session.Session)
+					// Upstream keep-alive
+					if session.Stream == nil || session.Stream.remote == nil {
 						return
 					}
-
-					URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: session.Stream.StreamName}
+					remote := session.Stream.remote
+					URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: session.Stream.Path}
 					request, _ := NewRequest("GET_PARAMETER", URL)
 					request.Headers["Session"] = session.Session
-
-					err := remote.SendRequestSync(request)
-					if err != nil {
-						LogCriticalf("⚠️ [SESSION] Keep-alive failed for session %s: %v. Stopping.", session.Session, err)
-						return
-					}
-
-					subscribers := 0
-					for e := session.Transports.Front(); e != nil; e = e.Next() {
-						transport := e.Value.(*Transport)
-						if interlayer, ok := remote.interlayers[transport.Substreams[0].Channel]; ok {
-							subscribers += interlayer.Subscribers.Len()
-						}
-						if interlayer, ok := remote.interlayers[transport.Substreams[1].Channel]; ok {
-							subscribers += interlayer.Subscribers.Len()
-						}
-					}
-
-					if subscribers == 0 {
-						session.nosubscribers++
-					} else {
-						session.nosubscribers = 0
-					}
-
-					if session.nosubscribers > 5 {
-						LogCriticalf("No subscribers for a long time for session %s. Tearing down.", session.Session)
-						tdRequest, _ := NewRequest("TEARDOWN", URL)
-						tdRequest.Headers["Session"] = session.Session
-						go remote.SendRequest(tdRequest)
-						return
-					}
-
+					remote.SendRequestSync(request)
 				case <-session.quit:
 					return
 				}

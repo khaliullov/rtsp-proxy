@@ -2,18 +2,19 @@ package rtspproxy
 
 import (
 	"log"
+	"sync/atomic"
 )
 
-var verbose bool = false
+var verbose atomic.Bool
 
 // SetVerbose sets the verbosity level for logging.
 func SetVerbose(v bool) {
-	verbose = v
+	verbose.Store(v)
 }
 
 // Logf prints a log message if verbose logging is enabled.
 func Logf(format string, v ...interface{}) {
-	if verbose {
+	if verbose.Load() {
 		log.Printf(format, v...)
 	}
 }

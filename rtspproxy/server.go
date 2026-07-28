@@ -12,14 +12,13 @@ import (
 
 // Server represents the RTSP proxy server.
 type Server struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	rtspPort     int
-	rtspListener *net.TCPListener
-	remotes      map[string]*Remote
-	clients      sync.WaitGroup // To track active client connections
-	remoteWg     sync.WaitGroup // To track active remote connections
-	mu           sync.Mutex     // Mutex for remotes map
+	ctx           context.Context
+	cancel        context.CancelFunc
+	rtspPort      int
+	rtspListener  *net.TCPListener
+	streamManager *StreamManager
+	clients       sync.WaitGroup // To track active client connections
+	remoteWg      sync.WaitGroup // To track active remote connections
 }
 
 // NewServer creates a new Server instance.
@@ -27,11 +26,12 @@ func NewServer(ctx context.Context) *Server {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	serverCtx, cancel := context.WithCancel(ctx)
-	return &Server{
-		ctx:     serverCtx,
-		cancel:  cancel,
-		remotes: make(map[string]*Remote),
+	s := &Server{
+		ctx:    serverCtx,
+		cancel: cancel,
 	}
+	s.streamManager = NewStreamManager(s)
+	return s
 }
 
 // Listen starts the server listening on the specified port.
@@ -89,13 +89,8 @@ func (server *Server) Shutdown(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	// 4. Disconnect all remotes
-	server.mu.Lock()
-	for host, remote := range server.remotes {
-		Logf("Disconnecting remote: %s", host)
-		remote.Disconnect() // This will also stop sessions and clean up
-	}
-	server.mu.Unlock()
+	// 4. Shutdown stream manager
+	server.streamManager.Shutdown()
 
 	// Wait for all remote-related goroutines to finish
 	remoteDone := make(chan struct{})
@@ -116,31 +111,9 @@ func (server *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// LookupRemote retrieves an existing remote connection or creates a new one.
-func (server *Server) LookupRemote(host, username, password string) *Remote {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-
-	if remote, ok := server.remotes[host]; ok {
-		return remote
-	}
-	remote := NewRemote(server, host, username, password)
-	if remote == nil {
-		LogCriticalf("Failed to create remote for host: %s", host)
-		return nil
-	}
-	server.remotes[host] = remote
-	return remote
-}
-
-// RemoveRemote removes a remote connection from the server's management.
-func (server *Server) RemoveRemote(host string) {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-	if _, ok := server.remotes[host]; ok {
-		delete(server.remotes, host)
-		Logf("Removed remote: %s", host)
-	}
+// LookupStream retrieves an existing stream or creates a new one.
+func (server *Server) LookupStream(host, username, password, path string) *Stream {
+	return server.streamManager.GetStream(host, username, password, path)
 }
 
 // Start begins accepting incoming client connections.

@@ -1,47 +1,56 @@
-# RTSP/1.0 proxy
+# RTSP/1.0 Proxy
 
-Proxy RTSP/RTP connections to real RTSP IP-cameras to save bandwidth.
-Based on [djwackey/dorsvr](https://github.com/djwackey/dorsvr/ "dorsvr source code page").
+High-performance RTSP/RTP proxy for IP cameras, designed to save bandwidth and reduce load on remote devices by fanning out a single upstream connection to multiple downstream clients.
 
 ## Synopsis
 
-rtsp://127.0.0.1:8554/rtsp/[login:password@]host[:port]/path
+`rtsp://127.0.0.1:8554/rtsp/[login:password@]host[:port]/path`
 
-where:
-
-    127.0.0.1:8554 - RTSP server host and port
-    /rtsp/ - proxied scheme ()
-    login:password - credentials for remote IP RTSP camera
-    host - IP/host of target IP camera
-    port - use different port for IP camera, by default 554
-    /path - profile endpoint
+Where:
+- `127.0.0.1:8554`: RTSP proxy host and port.
+- `/rtsp/`: Proxy path prefix.
+- `login:password`: Credentials for the remote IP camera.
+- `host`: IP/hostname of the target camera.
+- `port`: Remote RTSP port (default: 554).
+- `/path`: Camera stream path (e.g., `/Streaming/Channels/101`).
 
 ## Usage
-
-To run the proxy:
 
 ```bash
 ./rtsp-proxy -port 8554 -log /var/log/rtsp-proxy.log -verbose
 ```
 
--   `-port`: Specifies the port the proxy server will listen on (default: 554).
--   `-log`: Specifies the log file path (default: `-` for stderr).
--   `-verbose`: Enables verbose logging, showing detailed request/response and authentication information. Off by default.
+- `-port`: Port the proxy server will listen on (default: 554).
+- `-log`: Log file path (default: `-` for stderr).
+- `-verbose`: Enables detailed logging of RTSP traffic and internal state transitions.
 
-## Features / Improvements
+## Features
 
--   **Multi-client support**: Multiple clients can connect to the same RTSP stream from a remote camera, with the proxy efficiently fanning out the media data.
--   **Intelligent Caching**: Caches OPTIONS and SDP responses to reduce requests to the remote camera, improving performance and reducing load.
--   **Authentication Handling**: Improved Digest authentication retry mechanism, including clearing stale nonces for better compatibility with various cameras (e.g., Hikvision).
--   **SDP/RTP-Info Rewriting**: Automatically rewrites IP addresses in SDP and RTP-Info headers to reflect the proxy's address, ensuring clients connect correctly.
--   **Keep-Alive Mechanism**: Implements a session keep-alive using GET_PARAMETER requests to maintain active sessions with remote cameras.
--   **Subscriber Management**: Monitors active subscribers and tears down remote sessions when no clients are connected, conserving resources.
--   **Interleaved Data Handling**: Properly processes and forwards interleaved RTP/RTCP binary data.
--   **Robust Error Handling**: Enhanced logging and error recovery for client and remote connections.
--   **Configurable Logging**: Added a `-verbose` flag to control logging verbosity.
--   **Graceful Shutdown**: The server now handles OS signals (SIGINT, SIGTERM) to gracefully shut down, closing connections and cleaning up resources within a timeout.
+- **Connect On-Demand**: Establishing a connection to the camera only when needed. Metadata is fetched and cached automatically.
+- **Multi-Client Fanout**: Efficiently shares a single upstream connection across multiple downstream clients.
+- **Automatic Reconnect**: Resilient reconnection logic with exponential backoff and context-aware cancellation.
+- **Idle Disconnect**: Conserves resources by automatically closing idle upstream connections.
+- **Slow Client Isolation**: Independent client queues prevent slow or stalled clients from impacting others or the upstream stream.
+- **Thread-Safe Architecture**: Designed for high concurrency using Go's proven synchronization primitives.
+- **Expanded Metrics**: Real-time tracking of bitrate, packet counts, and connection health.
+
+## Architecture
+
+- **StreamManager**: Centralized registry for stream lifecycle management.
+- **State Machine**: Each stream follows a strictly enforced state lifecycle: `Disconnected` → `Connecting` -> `Playing` ↔ `Reconnecting`.
+- **Fanout Model**: Upstream reader dispatches packets to per-client buffered queues, handled by dedicated writer goroutines.
+- **Memory Management**: Optimized packet dispatching to minimize allocations and pressure on the garbage collector.
+
+## Protocol Support
+
+- RTSP/1.0
+- RTP over TCP (Interleaved)
+- Digest and Basic Authentication
+- SDP Rewriting (IP translation for proxy transparency)
+- RTP-Info Rewriting (Sequence and timestamp synchronization)
 
 ## TODO
 
--   Add support for UDP transport (currently only TCP interleaved is supported).
--   Consider adding support for other authentication schemes if needed.
+- Support for UDP transport.
+- Support for Multicast upstream.
+- Prometheus metrics exporter.

@@ -3,7 +3,6 @@ package rtspproxy
 import (
 	"fmt"
 	"net"
-	"net/url"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -27,10 +26,12 @@ type Client struct {
 	currentCSeq    string
 	responseBuffer string
 	host           string
+	basePath       string // 🔥 ДОБАВИТЬ: Базовый путь потока
 	username       string
 	password       string
 	server         *Server
 	writeChan      chan []byte
+	currentStream  *Stream
 	wg             sync.WaitGroup
 }
 
@@ -66,7 +67,7 @@ func (client *Client) writer() {
 				Logf("Client writer for [%s:%s] stopping, write channel closed.", client.remoteAddr, client.remotePort)
 				return
 			}
-			client.ClientConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			client.ClientConn.SetWriteDeadline(time.Now().Add(GlobalConfig.WriteTimeout))
 			_, err := client.ClientConn.Write(data)
 			client.ClientConn.SetWriteDeadline(time.Time{})
 			if err != nil {
@@ -89,13 +90,10 @@ func (client *Client) Destroy() error {
 func (client *Client) incomingRequestHandler() {
 	defer func() {
 		LogCriticalf("disconnected the client connection [%s:%s].", client.remoteAddr, client.remotePort)
-		client.Destroy()
-		if client.host != "" {
-			remote := client.server.LookupRemote(client.host, client.username, client.password)
-			if remote != nil {
-				remote.Unsubscribe(client)
-			}
+		if client.currentStream != nil {
+			client.currentStream.RemoveClient(client)
 		}
+		client.Destroy()
 	}()
 
 	buffer := make([]byte, rtspBufferSize)
@@ -107,8 +105,7 @@ func (client *Client) incomingRequestHandler() {
 			Logf("Client reader for [%s:%s] stopping due to server shutdown.", client.remoteAddr, client.remotePort)
 			return
 		default:
-			// Set a read deadline to allow checking the context
-			client.ClientConn.SetReadDeadline(time.Now().Add(time.Second))
+			client.ClientConn.SetReadDeadline(time.Now().Add(GlobalConfig.ReadTimeout))
 			recvLen, err := client.ClientConn.Read(buffer[length:])
 			client.ClientConn.SetReadDeadline(time.Time{}) // Clear deadline
 
@@ -134,7 +131,7 @@ func (client *Client) incomingRequestHandler() {
 						Logf("Client reader for [%s:%s] stopping during stream header read due to server shutdown.", client.remoteAddr, client.remotePort)
 						return
 					default:
-						client.ClientConn.SetReadDeadline(time.Now().Add(time.Second))
+						client.ClientConn.SetReadDeadline(time.Now().Add(GlobalConfig.ReadTimeout))
 						recvLen, err := client.ClientConn.Read(buffer[length:])
 						client.ClientConn.SetReadDeadline(time.Time{})
 						if err != nil {
@@ -158,7 +155,7 @@ func (client *Client) incomingRequestHandler() {
 						Logf("Client reader for [%s:%s] stopping during stream data read due to server shutdown.", client.remoteAddr, client.remotePort)
 						return
 					default:
-						client.ClientConn.SetReadDeadline(time.Now().Add(time.Second))
+						client.ClientConn.SetReadDeadline(time.Now().Add(GlobalConfig.ReadTimeout))
 						recvLen, err := client.ClientConn.Read(buffer[length:])
 						client.ClientConn.SetReadDeadline(time.Time{})
 						if err != nil {
@@ -177,21 +174,24 @@ func (client *Client) incomingRequestHandler() {
 				copy(dataBuffer, buffer[streamHeaderLength:streamHeaderLength+streamDataLength])
 				length = copy(buffer, buffer[streamHeaderLength+streamDataLength:length])
 
-				if client.host != "" {
-					remote := client.server.LookupRemote(client.host, client.username, client.password)
-					if remote != nil {
-						var remoteChannel int = tcpChannel
-						for ch, interlayer := range remote.interlayers {
-							for e := interlayer.Subscribers.Front(); e != nil; e = e.Next() {
-								if e.Value.(*Subscriber).Client == client && e.Value.(*Subscriber).Channel == tcpChannel {
-									remoteChannel = ch
-									break
-								}
+				if client.currentStream != nil && client.currentStream.remote != nil {
+					remote := client.currentStream.remote
+					// We need to map client channel back to upstream channel
+					// We can find this in ClientSession
+					upstreamChannel := tcpChannel
+					client.currentStream.mu.RLock()
+					if cs, ok := client.currentStream.clients[client]; ok {
+						for u, c := range cs.channels {
+							if c == tcpChannel {
+								upstreamChannel = u
+								break
 							}
 						}
-						Logf("📥 Received binary data from client on channel %d, forwarding to remote channel %d, len %d", tcpChannel, remoteChannel, streamDataLength)
-						go remote.SendBinary(remoteChannel, dataBuffer)
 					}
+					client.currentStream.mu.RUnlock()
+
+					Logf("📥 Received binary data from client on channel %d, forwarding to remote channel %d, len %d", tcpChannel, upstreamChannel, streamDataLength)
+					go remote.SendBinary(upstreamChannel, dataBuffer)
 				}
 				continue
 			}
@@ -224,8 +224,6 @@ func (client *Client) incomingRequestHandler() {
 						request.URL.Path = "/"
 					}
 				} else {
-					// 🔥 ЗАЩИТА: Если клиент стучится в корень прокси (OPTIONS * или /),
-					// отвечаем возможностями прокси, НЕ подключаясь к 127.0.0.1!
 					if request.Method == "OPTIONS" && (request.URL.Path == "*" || request.URL.Path == "/" || request.URL.Path == "") {
 						LogCriticalf("Client probing proxy directly. Responding with proxy capabilities.")
 						response, _ := NewResponse(200, "OK")
@@ -233,7 +231,7 @@ func (client *Client) incomingRequestHandler() {
 						response.Headers["Server"] = "RTSP-Proxy/1.0"
 						response.Headers["CSeq"] = client.getHeader(request, "CSeq")
 						client.ClientConn.Write([]byte(response.String()))
-						return // Завершаем обработку этого запроса
+						return
 					}
 					client.host = request.URL.Host
 				}
@@ -248,23 +246,17 @@ func (client *Client) incomingRequestHandler() {
 					}
 				}
 
-				// 🔥 LogCriticalf вместо Logf, чтобы видеть это без флага -verbose
-				LogCriticalf("✅ Resolved client target: host=%s, path=%s, user=%s", client.host, request.URL.Path, client.username)
+				// 🔥 КРИТИЧЕСКИ ВАЖНО: Запоминаем базовый путь при первом запросе!
+				client.basePath = request.URL.Path
+
+				LogCriticalf("✅ Resolved client target: host=%s, path=%s, user=%s", client.host, client.basePath, client.username)
 			}
 
-			remote := client.server.LookupRemote(client.host, client.username, client.password)
-			Logf("DEBUG: LookupRemote called with host: %s, username: %s, password: %s", client.host, client.username, client.password)
-
-			// 🔥 ГАРАНТИЯ АУТЕНТИФИКАЦИИ:
-			// Принудительно обновляем учетные данные в объекте Remote,
-			// чтобы механизм Digest-аутентификации точно сработал.
-			if client.username != "" && client.password != "" {
-				remote.digest.Username = client.username
-				remote.digest.Password = client.password
-			}
-
-			if remote == nil {
-				LogCriticalf("❌ Failed to create or find remote for host: %s", client.host)
+			// 🔥 ИСПОЛЬЗУЕМ basePath для поиска потока, а не request.URL.Path
+			stream := client.server.LookupStream(client.host, client.username, client.password, client.basePath)
+			client.currentStream = stream
+			if stream == nil {
+				LogCriticalf("❌ Failed to create or find stream for host: %s", client.host)
 				response := client.responseNotFound(request)
 				client.ClientConn.Write([]byte(response.String()))
 				return
@@ -273,23 +265,23 @@ func (client *Client) incomingRequestHandler() {
 			response := client.responseBadRequest(request)
 			switch request.Method {
 			case "OPTIONS":
-				response = client.handleOptions(remote, request)
+				response = client.handleOptions(stream, request)
 			case "DESCRIBE":
-				response = client.handleDescribe(remote, request)
+				response = client.handleDescribe(stream, request)
 			case "SETUP":
 				transport := client.getHeader(request, "Transport")
 				if transport != "" && strings.Contains(transport, "RTP/AVP") && !strings.Contains(transport, "RTP/AVP/TCP") {
 					LogCriticalf("⚠️ Client requested UDP (%s), but proxy only supports TCP. Sending 461 Unsupported Transport.", transport)
 					response = client.responseUnsupportedTransport(request)
 				} else {
-					response = client.handleSetup(remote, request)
+					response = client.handleSetup(stream, request)
 				}
 			case "PLAY":
-				response = client.handlePlay(remote, request)
+				response = client.handlePlay(stream, request)
 			case "TEARDOWN":
-				response = client.handleTeardown(remote, request)
+				response = client.handleTeardown(stream, request)
 			case "GET_PARAMETER":
-				response = client.handleGetParameter(remote, request)
+				response = client.handleGetParameter(stream, request)
 			}
 
 			response.Headers["Via"] = "RTSP-Proxy"
@@ -342,146 +334,150 @@ func (client *Client) responseUnauthorized(request *Request) *Response {
 	return response
 }
 
-func (client *Client) handleGetParameter(remote *Remote, request *Request) *Response {
-	path := request.GetURL().Path
+func (client *Client) handleGetParameter(stream *Stream, request *Request) *Response {
 	session := request.Headers["Session"]
-	stream := remote.LookupStream(path)
 	response, _ := NewResponse(200, "OK")
 	response.Headers["Session"] = session
 	response.Headers["Server"] = stream.Server
 	return response
 }
 
-func (client *Client) handleOptions(remote *Remote, request *Request) *Response {
-	streamName := request.GetURL().Path
-	stream := remote.LookupStream(streamName)
-
-	// 🔥 SMART PROXY: Если OPTIONS уже закэшированы первым клиентом,
-	// отвечаем мгновенно, не отправляя запрос камере и не рискуем оборвать стрим.
-	if stream.Options != "" {
-		response, _ := NewResponse(200, "OK")
-		response.Headers["Public"] = stream.Options
-		response.Headers["Server"] = stream.Server
-		return response
-	}
-
-	// Только для самого первого запроса идем к камере
-	URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: streamName}
-	optionsRequest, _ := NewRequest("OPTIONS", URL)
-	err := remote.SendRequestSync(optionsRequest)
-	if err != nil {
-		LogCriticalf("⚠️ Error getting OPTIONS: %v", err)
+func (client *Client) handleOptions(stream *Stream, request *Request) *Response {
+	// If stream is not connected yet, try to connect to get options
+	if stream.GetOptions() == "" {
+		stream.Start()
+		// Wait a bit for connection or just return default
+		select {
+		case <-client.server.ctx.Done():
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 
 	response, _ := NewResponse(200, "OK")
-	if stream.Options != "" {
-		response.Headers["Public"] = stream.Options
+	opts := stream.GetOptions()
+	if opts != "" {
+		response.Headers["Public"] = opts
 	} else {
 		response.Headers["Public"] = "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER"
 	}
-	response.Headers["Server"] = "RTSP-Proxy/1.0"
+	response.Headers["Server"] = stream.Server
 	return response
 }
 
-func (client *Client) handleSetup(remote *Remote, request *Request) *Response {
-	streamName, substreamName := filepath.Split(request.GetURL().Path)
-	streamName = filepath.Dir(streamName)
+func (client *Client) handleSetup(stream *Stream, request *Request) *Response {
+	_, substreamName := filepath.Split(request.GetURL().Path)
 	transport := client.getHeader(request, "Transport")
-	ssrc, session, err := remote.GetSsrcSession(client, streamName, substreamName, transport)
-	if err != nil {
-		LogCriticalf("Error while setup %s/%s: %v", streamName, substreamName, err)
-		remote.Disconnect()
+
+	protocol, comType, params := stream.remote.parseTransport(transport)
+
+	// Гарантируем, что процесс подключения запущен
+	stream.Start()
+
+	// 🔥 Ждем, пока connectLoop завершит OPTIONS, DESCRIBE, SETUP и PLAY (StatePlaying)
+	for i := 0; i < 100; i++ { // до 10 секунд
+		select {
+		case <-client.server.ctx.Done():
+			return client.responseBadRequest(request)
+		default:
+			st := stream.GetState()
+			if st == StatePlaying {
+				goto ready
+			}
+			if st == StateDisconnected || st == StateStopping {
+				LogCriticalf("❌ [SETUP] Stream disconnected during setup")
+				return client.responseBadRequest(request)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	if stream.GetState() != StatePlaying {
+		LogCriticalf("❌ [SETUP] Timeout waiting for stream to start")
 		return client.responseBadRequest(request)
 	}
-	stream := remote.LookupStream(streamName)
-	response, _ := NewResponse(200, "OK")
 
+ready:
+
+	upstreamTransport := stream.LookupTransport(substreamName, protocol, comType)
+	if upstreamTransport == nil {
+		LogCriticalf("❌ [SETUP] Failed to find upstream transport for %s", substreamName)
+		return client.responseBadRequest(request)
+	}
+
+	sessionID := upstreamTransport.Session.Session
+
+	// 🔥 КРИТИЧЕСКИ ВАЖНО: Добавляем клиента в поток ЗДЕСЬ, чтобы MapChannel сработал!
+	stream.AddClient(client, sessionID)
+
+	response, _ := NewResponse(200, "OK")
 	proxyIP := client.localAddr
 	if proxyIP == "0.0.0.0" {
 		proxyIP = "127.0.0.1"
 	}
 
+	// Interleaved channels for client
+	clientInterleaved := params["interleaved"]
+	if clientInterleaved != "" {
+		channels := strings.Split(clientInterleaved, "-")
+		ch1, _ := strconv.Atoi(channels[0])
+
+		// Теперь MapChannel найдет клиента в s.clients и корректно сохранит маппинг!
+		stream.MapChannel(client, upstreamTransport.Substreams[0].Channel, ch1)
+		if len(channels) > 1 {
+			ch2, _ := strconv.Atoi(channels[1])
+			stream.MapChannel(client, upstreamTransport.Substreams[1].Channel, ch2)
+		}
+	}
+
 	cleanTransport := regexp.MustCompile(`;?(destination|source)=[^;]+`).ReplaceAllString(transport, "")
-	response.Headers["Transport"] = fmt.Sprintf("%s;ssrc=%s;destination=%s;source=%s", cleanTransport, ssrc, client.remoteAddr, proxyIP)
+	response.Headers["Transport"] = fmt.Sprintf("%s;ssrc=%s;destination=%s;source=%s", cleanTransport, upstreamTransport.Ssrc, client.remoteAddr, proxyIP)
 	response.Headers["Cache-Control"] = "must-revalidate"
-	response.Headers["Session"] = session + ";timeout=60"
+	response.Headers["Session"] = sessionID + ";timeout=60"
 	response.Headers["Server"] = stream.Server
 	return response
 }
 
-func (client *Client) handleDescribe(remote *Remote, request *Request) *Response {
-	path := request.GetURL().Path
-	stream := remote.LookupStream(path)
+func (client *Client) handleDescribe(stream *Stream, request *Request) *Response {
+	stream.Start()
 
-	// 🔥 УМНЫЙ ПРОКСИ: Если SDP уже в кэше, отдаем его сразу, не дергая камеру!
-	if stream.SDP != "" {
-		response, _ := NewResponse(200, "OK")
-		response.Headers["Content-Type"] = "application/sdp"
-		response.Headers["Server"] = stream.Server
-
-		proxyIP := client.localAddr
-		if proxyIP == "0.0.0.0" || proxyIP == "127.0.0.1" {
-			proxyIP = "192.168.65.1"
+	// Wait for SDP to be available (increased timeout to 10s)
+	for i := 0; i < 100; i++ {
+		select {
+		case <-client.server.ctx.Done():
+			return client.responseBadRequest(request)
+		default:
+			if stream.GetSDP() != "" {
+				goto sdpReady
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
-
-		rewrittenSDP := strings.ReplaceAll(stream.SDP, "0.0.0.0", proxyIP)
-		rewrittenSDP = strings.ReplaceAll(rewrittenSDP, remote.remoteAddr, proxyIP)
-
-		hostIP, _, _ := net.SplitHostPort(remote.Host)
-		if hostIP != "" && hostIP != remote.remoteAddr {
-			rewrittenSDP = strings.ReplaceAll(rewrittenSDP, hostIP, proxyIP)
-		}
-
-		response.Headers["Content-Length"] = strconv.Itoa(len(rewrittenSDP))
-		response.Body = rewrittenSDP
-		return response
 	}
 
-	// Если кэша нет, запрашиваем у камеры
-	SDP, err := remote.GetSDP(path)
-	if err != nil {
-		remote.Disconnect()
-		if err.Error() == "unauthorized" {
-			return client.responseUnauthorized(request)
-		}
+	if stream.GetSDP() == "" {
+		LogCriticalf("❌ [DESCRIBE] Failed to get SDP for %s (timeout or error)", stream.Path)
 		return client.responseBadRequest(request)
 	}
+
+sdpReady:
+
 	response, _ := NewResponse(200, "OK")
 	response.Headers["Content-Type"] = "application/sdp"
 	response.Headers["Server"] = stream.Server
 
 	proxyIP := client.localAddr
-	if proxyIP == "0.0.0.0" {
+	if proxyIP == "0.0.0.0" || proxyIP == "127.0.0.1" {
 		proxyIP = "127.0.0.1"
 	}
 
-	// Rewrite SDP to replace remote IP with proxy local IP
-	rewrittenSDP := strings.ReplaceAll(SDP, remote.remoteAddr, proxyIP)
-	hostIP, _, _ := net.SplitHostPort(remote.Host)
-	if hostIP != "" && hostIP != remote.remoteAddr {
-		rewrittenSDP = strings.ReplaceAll(rewrittenSDP, hostIP, proxyIP)
-	}
+	rewrittenSDP := strings.ReplaceAll(stream.GetSDP(), "0.0.0.0", proxyIP)
 
 	response.Headers["Content-Length"] = strconv.Itoa(len(rewrittenSDP))
 	response.Body = rewrittenSDP
-
 	return response
 }
 
-func (client *Client) handlePlay(remote *Remote, request *Request) *Response {
-	path := filepath.Clean(request.GetURL().Path)
+func (client *Client) handlePlay(stream *Stream, request *Request) *Response {
 	sessionID := request.Headers["Session"]
-	stream := remote.LookupStream(path)
-
-	// 🔥 ВСЕГДА делегируем GetRTPInfo.
-	// Внутри него уже есть логика: если Seq == 0, он отправит PLAY камере.
-	// Если Seq > 0 (второй клиент), он мгновенно вернет кэшированный RTP-Info, не дергая камеру.
-	rtpInfo, err := remote.GetRTPInfo(path, sessionID)
-	if err != nil {
-		LogCriticalf("⚠️ Error during PLAY for session %s: %v", sessionID, err)
-		remote.Disconnect()
-		return client.responseBadRequest(request)
-	}
 
 	response, _ := NewResponse(200, "OK")
 	response.Headers["Range"] = request.Headers["Range"]
@@ -490,21 +486,22 @@ func (client *Client) handlePlay(remote *Remote, request *Request) *Response {
 
 	proxyIP := client.localAddr
 	if proxyIP == "0.0.0.0" || proxyIP == "127.0.0.1" {
-		proxyIP = "192.168.65.1"
+		proxyIP = "127.0.0.1"
 	}
 
-	rewrittenRTPInfo := regexp.MustCompile(`url=rtsp://[^/;]+`).ReplaceAllString(rtpInfo, "url=rtsp://"+proxyIP)
-	response.Headers["RTP-Info"] = rewrittenRTPInfo
+	// 🔥 ИСПРАВЛЕНИЕ: Избегаем двойного слеша (//) в URL
+	parts := []string{}
+	parts = append(parts, fmt.Sprintf("url=rtsp://%s%s;seq=0;rtptime=0", proxyIP, stream.Path))
+
+	response.Headers["RTP-Info"] = strings.Join(parts, ",")
 
 	return response
 }
 
-func (client *Client) handleTeardown(remote *Remote, request *Request) *Response {
-	path := request.GetURL().Path
-	session := request.Headers["Session"]
-	stream := remote.LookupStream(path)
+func (client *Client) handleTeardown(stream *Stream, request *Request) *Response {
+	stream.RemoveClient(client)
 	response, _ := NewResponse(200, "OK")
-	response.Headers["Session"] = session
+	response.Headers["Session"] = request.Headers["Session"]
 	response.Headers["Server"] = stream.Server
 	return response
 }
