@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,6 +34,7 @@ type Client struct {
 	writeChan      chan []byte
 	currentStream  *Stream
 	wg             sync.WaitGroup
+	destroyed      atomic.Bool
 }
 
 // NewClient creates a new Client instance.
@@ -52,11 +54,22 @@ func NewClient(server *Server, socket net.Conn) *Client {
 	go client.writer()
 
 	LogCriticalf("accepted the client connection [%s:%s].", client.remoteAddr, client.remotePort)
+	GlobalMetrics.ActiveClients.Add(1)
 	return client
 }
 
 func (client *Client) writer() {
 	defer client.wg.Done()
+
+	// 🔥 PRO-TIP: Гарантированный возврат буферов в пул при закрытии канала
+	defer func() {
+		for data := range client.writeChan {
+			if len(data) > 0 && data[0] == '$' && cap(data) == GlobalConfig.BufferSize {
+				packetPool.Put(data[:cap(data)])
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-client.server.ctx.Done():
@@ -70,6 +83,12 @@ func (client *Client) writer() {
 			client.ClientConn.SetWriteDeadline(time.Now().Add(GlobalConfig.WriteTimeout))
 			_, err := client.ClientConn.Write(data)
 			client.ClientConn.SetWriteDeadline(time.Time{})
+
+			// Возврат буфера после успешной записи
+			if len(data) > 0 && data[0] == '$' && cap(data) == GlobalConfig.BufferSize {
+				packetPool.Put(data[:cap(data)])
+			}
+
 			if err != nil {
 				LogCriticalf("Client write error [%s:%s]: %v", client.remoteAddr, client.remotePort, err)
 				return
@@ -80,10 +99,14 @@ func (client *Client) writer() {
 
 // Destroy closes the client connection and cleans up resources.
 func (client *Client) Destroy() error {
+	if client.destroyed.Swap(true) {
+		return nil
+	}
 	Logf("Destroying client connection [%s:%s].", client.remoteAddr, client.remotePort)
 	client.ClientConn.Close() // Unblock writer and reader
 	close(client.writeChan)
 	client.wg.Wait()
+	GlobalMetrics.ActiveClients.Add(-1)
 	return nil
 }
 
@@ -191,7 +214,7 @@ func (client *Client) incomingRequestHandler() {
 					client.currentStream.mu.RUnlock()
 
 					Logf("📥 Received binary data from client on channel %d, forwarding to remote channel %d, len %d", tcpChannel, upstreamChannel, streamDataLength)
-					go remote.SendBinary(upstreamChannel, dataBuffer)
+					_ = remote.SendBinary(upstreamChannel, dataBuffer)
 				}
 				continue
 			}
@@ -313,10 +336,7 @@ func (client *Client) responseUnsupportedTransport(request *Request) *Response {
 }
 
 func (client *Client) getHeader(request *Request, key string) string {
-	if value, ok := request.Headers[key]; ok {
-		return value
-	}
-	return ""
+	return headerGet(request.Headers, key)
 }
 
 func (client *Client) responseNotFound(request *Request) *Response {
@@ -335,7 +355,7 @@ func (client *Client) responseUnauthorized(request *Request) *Response {
 }
 
 func (client *Client) handleGetParameter(stream *Stream, request *Request) *Response {
-	session := request.Headers["Session"]
+	session := headerGet(request.Headers, "Session")
 	response, _ := NewResponse(200, "OK")
 	response.Headers["Session"] = session
 	response.Headers["Server"] = stream.Server
@@ -374,29 +394,20 @@ func (client *Client) handleSetup(stream *Stream, request *Request) *Response {
 	stream.Start()
 
 	// 🔥 Ждем, пока connectLoop завершит OPTIONS, DESCRIBE, SETUP и PLAY (StatePlaying)
-	for i := 0; i < 100; i++ { // до 10 секунд
-		select {
-		case <-client.server.ctx.Done():
+	select {
+	case <-client.server.ctx.Done():
+		return client.responseBadRequest(request)
+	case <-stream.ReadyCh():
+		if stream.GetState() == StateDestroyed {
+			return client.responseNotFound(request)
+		}
+		// Stream is now in StatePlaying (or was already)
+	case <-time.After(10 * time.Second):
+		if stream.GetState() != StatePlaying {
+			LogCriticalf("❌ [SETUP] Timeout waiting for stream to start")
 			return client.responseBadRequest(request)
-		default:
-			st := stream.GetState()
-			if st == StatePlaying {
-				goto ready
-			}
-			if st == StateDisconnected || st == StateStopping {
-				LogCriticalf("❌ [SETUP] Stream disconnected during setup")
-				return client.responseBadRequest(request)
-			}
-			time.Sleep(100 * time.Millisecond)
 		}
 	}
-
-	if stream.GetState() != StatePlaying {
-		LogCriticalf("❌ [SETUP] Timeout waiting for stream to start")
-		return client.responseBadRequest(request)
-	}
-
-ready:
 
 	upstreamTransport := stream.LookupTransport(substreamName, protocol, comType)
 	if upstreamTransport == nil {
@@ -441,24 +452,20 @@ func (client *Client) handleDescribe(stream *Stream, request *Request) *Response
 	stream.Start()
 
 	// Wait for SDP to be available (increased timeout to 10s)
-	for i := 0; i < 100; i++ {
-		select {
-		case <-client.server.ctx.Done():
+	select {
+	case <-client.server.ctx.Done():
+		return client.responseBadRequest(request)
+	case <-stream.SDPReadyCh():
+		if stream.GetState() == StateDestroyed {
+			return client.responseNotFound(request)
+		}
+		// SDP is now available (or was already)
+	case <-time.After(10 * time.Second):
+		if stream.GetSDP() == "" {
+			LogCriticalf("❌ [DESCRIBE] Failed to get SDP for %s (timeout or error)", stream.Path)
 			return client.responseBadRequest(request)
-		default:
-			if stream.GetSDP() != "" {
-				goto sdpReady
-			}
-			time.Sleep(100 * time.Millisecond)
 		}
 	}
-
-	if stream.GetSDP() == "" {
-		LogCriticalf("❌ [DESCRIBE] Failed to get SDP for %s (timeout or error)", stream.Path)
-		return client.responseBadRequest(request)
-	}
-
-sdpReady:
 
 	response, _ := NewResponse(200, "OK")
 	response.Headers["Content-Type"] = "application/sdp"
@@ -477,10 +484,10 @@ sdpReady:
 }
 
 func (client *Client) handlePlay(stream *Stream, request *Request) *Response {
-	sessionID := request.Headers["Session"]
+	sessionID := headerGet(request.Headers, "Session")
 
 	response, _ := NewResponse(200, "OK")
-	response.Headers["Range"] = request.Headers["Range"]
+	response.Headers["Range"] = headerGet(request.Headers, "Range")
 	response.Headers["Session"] = sessionID
 	response.Headers["Server"] = stream.Server
 
@@ -501,7 +508,7 @@ func (client *Client) handlePlay(stream *Stream, request *Request) *Response {
 func (client *Client) handleTeardown(stream *Stream, request *Request) *Response {
 	stream.RemoveClient(client)
 	response, _ := NewResponse(200, "OK")
-	response.Headers["Session"] = request.Headers["Session"]
+	response.Headers["Session"] = headerGet(request.Headers, "Session")
 	response.Headers["Server"] = stream.Server
 	return response
 }

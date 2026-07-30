@@ -48,18 +48,39 @@ func (cs *ClientSession) Start() {
 
 func (cs *ClientSession) run() {
 	defer cs.wg.Done()
+	// Ensure queue is drained and buffers returned to pool on exit
+	defer func() {
+		for {
+			select {
+			case data := <-cs.queue:
+				if len(data) > 0 && data[0] == '$' && cap(data) == GlobalConfig.BufferSize {
+					packetPool.Put(data[:cap(data)])
+				}
+			default:
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-cs.quit:
 			return
 		case <-cs.client.server.ctx.Done():
 			return
-		case packet := <-cs.queue:
+		case packet, ok := <-cs.queue:
+			if !ok {
+				return
+			}
 			// Forward packet to client's main write channel
 			select {
 			case cs.client.writeChan <- packet:
 			case <-time.After(100 * time.Millisecond):
 				LogCriticalf("Slow client [%s]: dropping packet and disconnecting", cs.client.remoteAddr)
+				// Return current packet to pool since it won't be handled by Client.writer
+				if len(packet) > 0 && packet[0] == '$' && cap(packet) == GlobalConfig.BufferSize {
+					packetPool.Put(packet[:cap(packet)])
+				}
 				cs.client.Destroy()
 				return
 			}

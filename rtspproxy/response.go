@@ -46,30 +46,6 @@ func NewResponseFromBuffer(buffer string) (*Response, error) {
 	return response, nil
 }
 
-func (response *Response) getLine(startOfLine string) (thisLineStart, nextLineStart string) {
-	var index int
-	for i, c := range startOfLine {
-		// Check for the end of line: \r\n (but also accept \r or \n by itself):
-		if c == '\r' || c == '\n' {
-			if c == '\r' {
-				// 🔥 ИСПРАВЛЕНИЕ: Проверка границ перед доступом к i+1
-				if i+1 < len(startOfLine) && startOfLine[i+1] == '\n' {
-					index = i + 2 // skip "\r\n"
-				} else {
-					index = i + 1 // skip "\r"
-				}
-			} else {
-				index = i + 1 // skip "\n"
-			}
-
-			thisLineStart = startOfLine[:i]
-			nextLineStart = startOfLine[index:]
-			break
-		}
-	}
-	return nextLineStart, thisLineStart
-}
-
 // ParseStatus parses the status line of an RTSP response.
 func (response *Response) ParseStatus(buffer string) error {
 	i := 0
@@ -101,59 +77,31 @@ func (response *Response) ParseStatus(buffer string) error {
 	return nil
 }
 
-func (response *Response) getHeader(buffer string) (string, string, error) {
-	key := ""
-	value := ""
-	i := 0
-	for i = 0; i < len(buffer) && buffer[i] != ':'; i++ {
-		key += string(buffer[i])
-	}
-	i++
-	state := "skip whitespace"
-	for ; i < len(buffer); i++ {
-		switch state {
-		case "skip whitespace":
-			if buffer[i] != ' ' && buffer[i] != '\t' && buffer[i] != '\r' && buffer[i] != '\n' {
-				value += string(buffer[i])
-				state = "value"
-			}
-		case "value":
-			{
-				if buffer[i] != '\t' && buffer[i] != '\r' && buffer[i] != '\n' {
-					value += string(buffer[i])
-					if buffer[i] == ';' {
-						state = "skip whitespace"
-					}
-				}
-			}
-		}
-	}
-
-	return key, value, nil
-}
-
 // ParseResponse parses an entire RTSP response from a buffer.
 func (response *Response) ParseResponse(buffer string) error {
-	nextLineStart, thisLineStart := response.getLine(buffer)
-	err := response.ParseStatus(thisLineStart)
-
+	next, thisLine := sharedLineSplit(buffer)
+	err := response.ParseStatus(thisLine)
 	if err != nil {
 		return err
 	}
 	for {
-		nextLineStart, thisLineStart = response.getLine(nextLineStart)
-		if thisLineStart == "" {
+		next, thisLine = sharedLineSplit(next)
+		if thisLine == "" {
 			break
 		}
-		key, value, err := response.getHeader(thisLineStart)
+		key, value, err := sharedParseHeader(thisLine)
 		if err != nil {
 			return err
 		}
 		response.Headers[key] = value
 	}
-	if contentLengthRaw, ok := response.Headers["Content-Length"]; ok {
+	if contentLengthRaw := headerGet(response.Headers, "Content-Length"); contentLengthRaw != "" {
 		contentLength, _ := strconv.Atoi(contentLengthRaw)
-		response.Body = nextLineStart[0 : contentLength-1]
+		if contentLength > 0 && contentLength <= len(next) {
+			response.Body = next[:contentLength]
+		} else if contentLength > 0 {
+			response.Body = next
+		}
 		return nil
 	}
 	return nil

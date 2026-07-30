@@ -1,5 +1,7 @@
 package rtspproxy
 
+import "sync"
+
 // Transport represents an RTSP transport for a media stream.
 type Transport struct {
 	SubstreamName string
@@ -8,6 +10,7 @@ type Transport struct {
 	ComType       string // always unicast
 	Ssrc          string
 	Substreams    map[int]*Substream
+	mu            sync.RWMutex
 }
 
 // NewTransport creates a new Transport instance.

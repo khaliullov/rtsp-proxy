@@ -1,6 +1,7 @@
 package rtspproxy
 
 import (
+	"context"
 	"time"
 )
 
@@ -17,22 +18,26 @@ func NewIPC(timeout ...int) *Ipc {
 		defautlTimeout = timeout[0]
 	}
 	ipc := &Ipc{
-		Channel: make(chan string),
+		// Buffered channel ensures the sender (readLoop) never blocks.
+		Channel: make(chan string, 1),
 		timeout: defautlTimeout,
 	}
 	return ipc
 }
 
-// GetResponse waits for a response on the IPC channel or times out.
-func (ipc *Ipc) GetResponse() string {
+// GetResponse waits for a response on the IPC channel or times out/cancels.
+func (ipc *Ipc) GetResponse(ctx context.Context) string {
 	toSleep := time.Duration(ipc.timeout) * time.Second
+	timer := time.NewTimer(toSleep)
+	defer timer.Stop()
 	defer close(ipc.Channel)
-	var res string
+
 	select {
-	case res = <-ipc.Channel:
+	case res := <-ipc.Channel:
 		return res
-	case <-time.After(toSleep):
-		res = "timeout"
+	case <-ctx.Done():
+		return "timeout" // Cancelled
+	case <-timer.C:
+		return "timeout"
 	}
-	return res
 }

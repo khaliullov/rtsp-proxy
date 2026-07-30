@@ -1,9 +1,11 @@
 package rtspproxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -38,28 +40,35 @@ func TestStreamLifecycle(t *testing.T) {
 					if err != nil {
 						return
 					}
-					req := string(buf[:n])
-					if req == "" {
-						continue
-					}
-					if req[:7] == "OPTIONS" {
-						c.Write([]byte("RTSP/1.0 200 OK\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY\r\nCSeq: 1\r\n\r\n"))
-					} else if req[:8] == "DESCRIBE" {
-						sdp := "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Mock\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=control:track1\r\n"
-						c.Write([]byte(fmt.Sprintf("RTSP/1.0 200 OK\r\nContent-Type: application/sdp\r\nContent-Length: %d\r\nCSeq: 2\r\n\r\n%s", len(sdp), sdp)))
-					} else if req[:5] == "SETUP" {
-						c.Write([]byte("RTSP/1.0 200 OK\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=12345678\r\nSession: 1234\r\nCSeq: 3\r\n\r\n"))
-					} else if req[:4] == "PLAY" {
-						c.Write([]byte("RTSP/1.0 200 OK\r\nRTP-Info: url=rtsp://127.0.0.1/mock/track1;seq=1;rtptime=1\r\nSession: 1234\r\nCSeq: 4\r\n\r\n"))
-						go func() {
-							for {
-								_, err := c.Write([]byte{'$', 0, 0, 4, 1, 2, 3, 4})
-								if err != nil {
-									return
+					data := buf[:n]
+					for len(data) > 0 {
+						// Simple split by double CRLF for RTSP messages
+						eol := bytes.Index(data, []byte("\r\n\r\n"))
+						if eol == -1 {
+							break
+						}
+						req := string(data[:eol+4])
+						data = data[eol+4:]
+
+						if strings.Contains(req, "OPTIONS") {
+							c.Write([]byte("RTSP/1.0 200 OK\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY\r\nCSeq: 1\r\n\r\n"))
+						} else if strings.Contains(req, "DESCRIBE") {
+							sdp := "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Mock\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=control:track1\r\n"
+							c.Write([]byte(fmt.Sprintf("RTSP/1.0 200 OK\r\nContent-Type: application/sdp\r\nContent-Length: %d\r\nCSeq: 2\r\n\r\n%s", len(sdp), sdp)))
+						} else if strings.Contains(req, "SETUP") {
+							c.Write([]byte("RTSP/1.0 200 OK\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=12345678\r\nSession: 1234\r\nCSeq: 3\r\n\r\n"))
+						} else if strings.Contains(req, "PLAY") {
+							c.Write([]byte("RTSP/1.0 200 OK\r\nRTP-Info: url=rtsp://127.0.0.1/mock/track1;seq=1;rtptime=1\r\nSession: 1234\r\nCSeq: 4\r\n\r\n"))
+							go func() {
+								for {
+									_, err := c.Write([]byte{'$', 0, 0, 4, 1, 2, 3, 4})
+									if err != nil {
+										return
+									}
+									time.Sleep(100 * time.Millisecond)
 								}
-								time.Sleep(100 * time.Millisecond)
-							}
-						}()
+							}()
+						}
 					}
 				}
 			}(conn)
@@ -224,27 +233,31 @@ func TestDescribeOnDemand(t *testing.T) {
 	camAddr := ln.Addr().String()
 
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		buf := make([]byte, 4096)
 		for {
-			n, err := conn.Read(buf)
+			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			req := string(buf[:n])
-			if req == "" {
-				continue
-			}
-			if req[:7] == "OPTIONS" {
-				conn.Write([]byte("RTSP/1.0 200 OK\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY\r\nCSeq: 1\r\n\r\n"))
-			} else if req[:8] == "DESCRIBE" {
-				sdp := "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Mock\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=control:track1\r\n"
-				conn.Write([]byte(fmt.Sprintf("RTSP/1.0 200 OK\r\nContent-Type: application/sdp\r\nContent-Length: %d\r\nCSeq: 2\r\n\r\n%s", len(sdp), sdp)))
-			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					req := string(buf[:n])
+					if req == "" {
+						continue
+					}
+					if req[:7] == "OPTIONS" {
+						c.Write([]byte("RTSP/1.0 200 OK\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY\r\nCSeq: 1\r\n\r\n"))
+					} else if req[:8] == "DESCRIBE" {
+						sdp := "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Mock\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=control:track1\r\n"
+						c.Write([]byte(fmt.Sprintf("RTSP/1.0 200 OK\r\nContent-Type: application/sdp\r\nContent-Length: %d\r\nCSeq: 2\r\n\r\n%s", len(sdp), sdp)))
+					}
+				}
+			}(conn)
 		}
 	}()
 
@@ -254,7 +267,13 @@ func TestDescribeOnDemand(t *testing.T) {
 	cln, _ := net.Listen("tcp", "127.0.0.1:0")
 	go func() {
 		c, _ := net.Dial("tcp", cln.Addr().String())
-		c.Close()
+		buf := make([]byte, 1024)
+		for {
+			_, err := c.Read(buf)
+			if err != nil {
+				return
+			}
+		}
 	}()
 	conn, _ := cln.Accept()
 	client := NewClient(server, conn)
@@ -265,7 +284,7 @@ func TestDescribeOnDemand(t *testing.T) {
 		t.Errorf("expected 200 OK for cold DESCRIBE, got %d", resp.Code)
 	}
 
-	if stream.SDP == "" {
+	if stream.GetSDP() == "" {
 		t.Error("SDP should not be empty")
 	}
 }

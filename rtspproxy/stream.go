@@ -5,13 +5,18 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// packetPool manages reusable byte buffers for RTP packets to reduce GC pressure.
+var packetPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, GlobalConfig.BufferSize)
+	},
+}
 
 // StreamState represents the current state of the stream.
 type StreamState int
@@ -72,20 +77,26 @@ type Stream struct {
 	loopStarted atomic.Bool
 
 	// Metrics
-	PacketsForwarded uint64
-	PacketsDropped   uint64
-	BytesForwarded   uint64
-	ReconnectCount   uint64
-	LastReconnect    time.Time
-	ReconnectTotal   time.Duration
-	StartTime        time.Time
-	LastPktTime      time.Time
+	PacketsForwarded      uint64
+	PacketsDropped        uint64
+	BytesForwarded        uint64
+	SessionBytesForwarded uint64
+	ReconnectCount        uint64
+	LastReconnect         time.Time
+	ReconnectTotal        time.Duration
+	StartTime             time.Time
+	SessionStartTime      time.Time
+	LastPktTime           time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
 	IdleTimeout time.Duration
+
+	// Signals for on-demand connection
+	readyCh    chan struct{}
+	sdpReadyCh chan struct{}
 }
 
 // NewStream creates a new Stream instance.
@@ -104,6 +115,8 @@ func NewStream(server *Server, host, username, password, path string) *Stream {
 		cancel:      cancel,
 		IdleTimeout: GlobalConfig.IdleTimeout,
 		StartTime:   time.Now(),
+		readyCh:     make(chan struct{}),
+		sdpReadyCh:  make(chan struct{}),
 	}
 	return s
 }
@@ -128,8 +141,60 @@ func (s *Stream) unsafeSetState(state StreamState) {
 	if s.state == state {
 		return
 	}
+
+	// If we are starting a new connection attempt, ensure old waiters are released
+	if (s.state == StateDisconnected || s.state == StateReconnecting) && state == StateConnecting {
+		if s.readyCh != nil {
+			select {
+			case <-s.readyCh:
+				// Already closed
+			default:
+				close(s.readyCh)
+			}
+		}
+		if s.sdpReadyCh != nil {
+			select {
+			case <-s.sdpReadyCh:
+				// Already closed
+			default:
+				close(s.sdpReadyCh)
+			}
+		}
+		s.readyCh = make(chan struct{})
+		s.sdpReadyCh = make(chan struct{})
+	}
+
+	// Close ready signal when entering Playing state
+	if state == StatePlaying {
+		s.SessionStartTime = time.Now()
+		atomic.StoreUint64(&s.SessionBytesForwarded, 0)
+		select {
+		case <-s.readyCh:
+		default:
+			close(s.readyCh)
+		}
+	}
+
 	Logf("Stream [%s] state change: %s -> %s", s.Path, s.state, state)
 	s.state = state
+
+	// If destroyed, close everything one last time
+	if state == StateDestroyed {
+		if s.readyCh != nil {
+			select {
+			case <-s.readyCh:
+			default:
+				close(s.readyCh)
+			}
+		}
+		if s.sdpReadyCh != nil {
+			select {
+			case <-s.sdpReadyCh:
+			default:
+				close(s.sdpReadyCh)
+			}
+		}
+	}
 }
 
 func (s *Stream) transition(to StreamState) error {
@@ -145,13 +210,13 @@ func (s *Stream) transition(to StreamState) error {
 	case StateDisconnected:
 		valid = to == StateConnecting || to == StateDestroyed
 	case StateConnecting:
-		valid = to == StatePlaying || to == StateReconnecting || to == StateStopping || to == StateDestroyed
+		valid = to == StatePlaying || to == StateReconnecting || to == StateStopping || to == StateDestroyed || to == StateConnecting
 	case StatePlaying:
-		valid = to == StateReconnecting || to == StateStopping || to == StateDestroyed
+		valid = to == StateReconnecting || to == StateStopping || to == StateDestroyed || to == StatePlaying
 	case StateReconnecting:
-		valid = to == StatePlaying || to == StateDisconnected || to == StateStopping || to == StateDestroyed
+		valid = to == StatePlaying || to == StateDisconnected || to == StateStopping || to == StateDestroyed || to == StateConnecting || to == StateReconnecting
 	case StateStopping:
-		valid = to == StateDisconnected || to == StateDestroyed
+		valid = to == StateDisconnected || to == StateDestroyed || to == StateStopping
 	}
 
 	if !valid {
@@ -214,6 +279,7 @@ func (s *Stream) Start() {
 		s.resetIdleTimer()
 	}
 
+	s.unsafeSetState(StateConnecting)
 	s.startConnectLoop()
 }
 
@@ -252,16 +318,28 @@ func (s *Stream) stopIdleTimer() {
 	}
 }
 
-// Stop closes the upstream connection.
+// Stop closes the upstream connection and clears sessions.
 func (s *Stream) Stop() {
 	if err := s.transition(StateStopping); err != nil {
 		return
 	}
 	s.mu.Lock()
-	if s.remote != nil {
-		s.remote.Disconnect()
-	}
+	remote := s.remote
+	sessions := s.sessions
+	s.sessions = make(map[string]*Session)
 	s.mu.Unlock()
+
+	if remote != nil {
+		for id := range sessions {
+			_ = remote.SendTeardown(s.Path, id)
+		}
+		remote.Disconnect()
+	}
+
+	for _, sess := range sessions {
+		sess.Stop()
+	}
+
 	s.transition(StateDisconnected)
 }
 
@@ -269,16 +347,31 @@ func (s *Stream) Stop() {
 func (s *Stream) Destroy() {
 	s.transition(StateDestroyed)
 	s.cancel()
+
 	s.mu.Lock()
-	if s.remote != nil {
-		s.remote.Disconnect()
-	}
-	for _, cs := range s.clients {
-		cs.Stop()
-	}
+	remote := s.remote
+	s.remote = nil
+	clients := s.clients
 	s.clients = make(map[*Client]*ClientSession)
+	sessions := s.sessions
+	s.sessions = make(map[string]*Session)
 	s.stopIdleTimer()
 	s.mu.Unlock()
+
+	if remote != nil {
+		for id := range sessions {
+			_ = remote.SendTeardown(s.Path, id)
+		}
+		remote.Disconnect()
+	}
+
+	for _, cs := range clients {
+		cs.Stop()
+	}
+
+	for _, sess := range sessions {
+		sess.Stop()
+	}
 
 	if s.onDestroy != nil {
 		s.onDestroy()
@@ -307,17 +400,23 @@ func (s *Stream) connectLoop() {
 
 		if st == StateReconnecting {
 			atomic.AddUint64(&s.ReconnectCount, 1)
-		} else {
-			if err := s.transition(StateConnecting); err != nil {
-				return
+			GlobalMetrics.Reconnects.Add(1)
+			s.mu.Lock()
+			if s.LastReconnect.IsZero() {
+				s.LastReconnect = time.Now()
 			}
+			s.mu.Unlock()
+		}
+
+		if err := s.transition(StateConnecting); err != nil {
+			return
 		}
 
 		s.mu.Lock()
 		if s.remote != nil {
 			s.remote.Disconnect()
 		}
-		s.remote = NewRemote(s.server, s.Host, s.Username, s.Password)
+		s.remote = NewRemote(s)
 		remote := s.remote
 		s.mu.Unlock()
 
@@ -337,6 +436,13 @@ func (s *Stream) connectLoop() {
 
 			err = s.doConnectSequence()
 			if err == nil {
+				s.mu.Lock()
+				if !s.LastReconnect.IsZero() {
+					s.ReconnectTotal += time.Since(s.LastReconnect)
+					s.LastReconnect = time.Time{}
+				}
+				s.mu.Unlock()
+
 				if err := s.transition(StatePlaying); err != nil {
 					readCancel()
 					<-readDone
@@ -419,14 +525,7 @@ func (s *Stream) doConnectSequence() error {
 		return fmt.Errorf("OPTIONS failed: %w", err)
 	}
 
-	remote.connMutex.Lock()
-	if rs, ok := remote.streams[s.Path]; ok {
-		s.mu.Lock()
-		s.Options = rs.Options
-		s.Server = rs.Server
-		s.mu.Unlock()
-	}
-	remote.connMutex.Unlock()
+	// Options/Server are written by remote.handleOptions into this same Stream.
 
 	// 2. DESCRIBE
 	sdp, err := remote.GetSDP(s.Path)
@@ -435,6 +534,11 @@ func (s *Stream) doConnectSequence() error {
 	}
 	s.mu.Lock()
 	s.SDP = sdp
+	select {
+	case <-s.sdpReadyCh:
+	default:
+		close(s.sdpReadyCh)
+	}
 	s.mu.Unlock()
 
 	// 3. SETUP (for each track in SDP)
@@ -475,6 +579,20 @@ func (s *Stream) GetOptions() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.Options
+}
+
+// ReadyCh returns a channel that is closed when the stream enters Playing state.
+func (s *Stream) ReadyCh() chan struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.readyCh
+}
+
+// SDPReadyCh returns a channel that is closed when the SDP is available.
+func (s *Stream) SDPReadyCh() chan struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sdpReadyCh
 }
 
 func (s *Stream) readLoop(ctx context.Context) error {
@@ -535,12 +653,8 @@ func (s *Stream) readLoop(ctx context.Context) error {
 					break // Need more data for headers
 				}
 
-				headerPart := string(buffer[:eol])
-				contentLength := 0
-				contentLengthMatch := regexp.MustCompile(`(?i)\r\nContent-Length:\s*(\d+)\r\n`).FindStringSubmatch(headerPart)
-				if len(contentLengthMatch) > 1 {
-					contentLength, _ = strconv.Atoi(contentLengthMatch[1])
-				}
+				headerPart := buffer[:eol]
+				contentLength := sharedParseContentLength(headerPart)
 
 				totalMsgLen := eol + 4 + contentLength
 				if length < totalMsgLen {
@@ -576,47 +690,73 @@ func (s *Stream) readLoop(ctx context.Context) error {
 	}
 }
 
+// targetSnapshot describes a single client delivery point.
+type targetSnapshot struct {
+	cs            *ClientSession
+	clientChannel int
+	remoteAddr    string
+}
+
+// targetPool avoids allocation for fan-out snapshots.
+var targetPool = sync.Pool{
+	New: func() interface{} {
+		return make([]targetSnapshot, 0, 10)
+	},
+}
+
 func (s *Stream) dispatch(channel int, packet []byte) {
 	now := time.Now()
 	atomic.AddUint64(&s.PacketsForwarded, 1)
 	atomic.AddUint64(&s.BytesForwarded, uint64(len(packet)))
+	atomic.AddUint64(&s.SessionBytesForwarded, uint64(len(packet)))
+	GlobalMetrics.PacketsForwarded.Add(1)
+	GlobalMetrics.BytesForwarded.Add(uint64(len(packet)))
 
 	s.mu.Lock()
 	s.LastPktTime = now
-	s.mu.Unlock()
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	targets := targetPool.Get().([]targetSnapshot)[:0]
 	for client, cs := range s.clients {
 		clientChannel, ok := cs.channels[channel]
 		if !ok {
-			// Logf("Stream [%s] no mapping for channel %d for client %s", s.Path, channel, client.remoteAddr)
 			continue
 		}
+		targets = append(targets, targetSnapshot{cs: cs, clientChannel: clientChannel, remoteAddr: client.remoteAddr})
+	}
+	s.mu.Unlock()
 
-		// Optimization: only copy if we need to modify the channel byte
-		// Since we modify it for every client, we MUST copy.
-		clientPacket := make([]byte, len(packet))
+	for _, t := range targets {
+		buf := packetPool.Get().([]byte)
+		clientPacket := buf[:len(packet)]
 		copy(clientPacket, packet)
-		clientPacket[1] = byte(clientChannel)
+		clientPacket[1] = byte(t.clientChannel)
 
-		if !cs.Push(clientPacket) {
+		if !t.cs.Push(clientPacket) {
 			atomic.AddUint64(&s.PacketsDropped, 1)
-			LogCriticalf("Stream [%s] dropping packet for slow client %s", s.Path, client.remoteAddr)
+			GlobalMetrics.PacketsDropped.Add(1)
+			LogCriticalf("Stream [%s] dropping packet for slow client %s", s.Path, t.remoteAddr)
+			packetPool.Put(buf)
 		}
 	}
+
+	targetPool.Put(targets)
 }
 
-// GetBitrate returns the current bitrate in bits per second.
+// GetBitrate returns the current bitrate in bits per second for the active session.
 func (s *Stream) GetBitrate() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	elapsed := time.Since(s.StartTime).Seconds()
+
+	start := s.SessionStartTime
+	if start.IsZero() {
+		start = s.StartTime
+	}
+
+	elapsed := time.Since(start).Seconds()
 	if elapsed < 1 {
 		return 0
 	}
-	return uint64(float64(atomic.LoadUint64(&s.BytesForwarded)*8) / elapsed)
+	return uint64(float64(atomic.LoadUint64(&s.SessionBytesForwarded)*8) / elapsed)
 }
 
 // ReportMetrics logs the current stream metrics.
@@ -653,26 +793,52 @@ func (s *Stream) parseTracks(sdp string) []string {
 	var tracks []string
 	lines := strings.Split(sdp, "\n")
 	inMedia := false
+	baseURL := ""
+
+	// Collect session-level control (for resolving relative tracks)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "m=") {
+			break
+		}
+		if strings.HasPrefix(line, "a=control:") {
+			ctrl := strings.TrimPrefix(line, "a=control:")
+			if ctrl != "*" {
+				baseURL = ctrl
+			}
+		}
+	}
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "m=") {
 			inMedia = true
+			continue
 		}
-		if inMedia && strings.HasPrefix(line, "a=control:") {
+		if !inMedia {
+			continue
+		}
+		// New media section resets relative context but we keep collecting all tracks
+		if strings.HasPrefix(line, "a=control:") {
 			control := strings.TrimPrefix(line, "a=control:")
-			if control != "*" { // 🔥 Игнорируем wildcard на уровне сессии
-				if !strings.HasPrefix(control, "rtsp://") {
-					tracks = append(tracks, control)
-				} else {
-					tracks = append(tracks, control)
-				}
+			if control == "*" {
+				continue // session-level wildcard, skip
+			}
+			if strings.HasPrefix(control, "rtsp://") {
+				// Absolute control URL — keep as-is (SetupUpstream handles it)
+				tracks = append(tracks, control)
+			} else if baseURL != "" && strings.HasPrefix(baseURL, "rtsp://") {
+				// Resolve relative track against session control base
+				base := strings.TrimRight(baseURL, "/")
+				tracks = append(tracks, base+"/"+strings.TrimLeft(control, "/"))
+			} else {
+				tracks = append(tracks, control)
 			}
 		}
 	}
 
 	if len(tracks) == 0 {
-		// Fallback: если явных треков нет, используем базовый URL
+		// Fallback: no explicit tracks — use base path
 		tracks = append(tracks, "")
 	}
 	return tracks
@@ -713,7 +879,7 @@ func (s *Stream) LookupSession(sessionID string, args ...int) *Session {
 		return session
 	}
 
-	session := NewSession(nil, sessionID, timeout)
+	session := NewSession(s, sessionID, timeout)
 	s.sessions[sessionID] = session
 	return session
 }

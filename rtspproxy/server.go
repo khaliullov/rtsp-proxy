@@ -18,7 +18,6 @@ type Server struct {
 	rtspListener  *net.TCPListener
 	streamManager *StreamManager
 	clients       sync.WaitGroup // To track active client connections
-	remoteWg      sync.WaitGroup // To track active remote connections
 }
 
 // NewServer creates a new Server instance.
@@ -91,21 +90,6 @@ func (server *Server) Shutdown(ctx context.Context) error {
 
 	// 4. Shutdown stream manager
 	server.streamManager.Shutdown()
-
-	// Wait for all remote-related goroutines to finish
-	remoteDone := make(chan struct{})
-	go func() {
-		server.remoteWg.Wait()
-		close(remoteDone)
-	}()
-
-	select {
-	case <-remoteDone:
-		LogCriticalf("All remote connections closed.")
-	case <-ctx.Done():
-		LogCriticalf("Shutdown context timed out while waiting for remotes to close.")
-		return ctx.Err()
-	}
 
 	LogCriticalf("Server shutdown complete.")
 	return nil

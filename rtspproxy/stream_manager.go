@@ -1,6 +1,7 @@
 package rtspproxy
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -55,7 +56,8 @@ func (sm *StreamManager) GetStream(host, username, password, path string) *Strea
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	key := host + path
+	// Authentication context participates in stream identity to ensure isolation
+	key := fmt.Sprintf("%s:%s@%s%s", username, password, host, path)
 	if stream, ok := sm.streams[key]; ok {
 		return stream
 	}
@@ -64,8 +66,10 @@ func (sm *StreamManager) GetStream(host, username, password, path string) *Strea
 	// Set cleanup callback
 	stream.onDestroy = func() {
 		sm.RemoveStream(key)
+		GlobalMetrics.ActiveStreams.Add(-1)
 	}
 	sm.streams[key] = stream
+	GlobalMetrics.ActiveStreams.Add(1)
 	return stream
 }
 

@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +15,7 @@ import (
 )
 
 // Remote represents a connection to a remote RTSP server.
+// It is always owned by a single *Stream (no internal Stream map).
 type Remote struct {
 	Host        string
 	RemoteConn  *net.TCPConn
@@ -25,29 +25,16 @@ type Remote struct {
 	remoteAddr  string
 	currentCSeq int
 	Server      *Server
+	stream      *Stream // parent Stream from StreamManager — sole source of truth
 	connMutex   sync.Mutex
 	addr        *net.TCPAddr
-	streams     map[string]*Stream // Internal tracking for RTSP state
 	requests    *list.List
 	digest      *Digest
 }
 
-// LookupStream retrieves an existing stream or creates a new one if it doesn't exist.
-func (remote *Remote) LookupStream(streamName string) *Stream {
-	if stream, ok := remote.streams[streamName]; ok {
-		return stream
-	}
-	stream := &Stream{
-		Path:     streamName,
-		sessions: make(map[string]*Session),
-	}
-	remote.streams[streamName] = stream
-	return stream
-}
-
-// NewRemote creates a new Remote instance.
-func NewRemote(server *Server, host, username, password string) *Remote {
-	Logf("DEBUG: NewRemote called with host: %q, username: %q", host, username)
+// NewRemote creates a new Remote bound to the given Stream.
+func NewRemote(stream *Stream) *Remote {
+	host := stream.Host
 	addr, err := net.ResolveTCPAddr("tcp", host)
 	if err != nil {
 		LogCriticalf("Failed to resolve TCP address for host %q: %s", host, err.Error())
@@ -56,92 +43,49 @@ func NewRemote(server *Server, host, username, password string) *Remote {
 
 	remote := &Remote{
 		Host:     host,
-		Server:   server,
+		Server:   stream.server,
+		stream:   stream,
 		addr:     addr,
-		streams:  make(map[string]*Stream),
 		requests: list.New(),
 		digest:   NewDigest(),
 	}
-	if username != "" {
-		remote.digest.Username = username
-		remote.digest.Password = password
+	if stream.Username != "" {
+		remote.digest.Username = stream.Username
+		remote.digest.Password = stream.Password
 	}
-	Logf("DEBUG: NewRemote created for host: %q", remote.Host)
-	// Connect on-demand: Dial() is no longer called here.
-	// It will be triggered by the first SendRequest.
 	return remote
 }
 
 // Dial establishes a connection to the remote RTSP server.
 func (remote *Remote) Dial() error {
-	Logf("DEBUG: Dialing remote host: %q", remote.Host)
-	select {
-	case <-remote.Server.ctx.Done():
-		return fmt.Errorf("server is shutting down")
-	default:
-		dialer := net.Dialer{Timeout: GlobalConfig.DialTimeout}
-		socket, err := dialer.DialContext(remote.Server.ctx, "tcp", remote.Host)
-		if err != nil {
-			return fmt.Errorf("failed to connect to %q: %w", remote.Host, err)
-		}
-
-		localAddr := strings.Split(socket.LocalAddr().String(), ":")
-		remoteAddr := strings.Split(socket.RemoteAddr().String(), ":")
-
-		remote.connMutex.Lock()
-		if remote.RemoteConn != nil {
-			remote.RemoteConn.Close()
-		}
-		remote.RemoteConn, _ = socket.(*net.TCPConn)
-		remote.localAddr = localAddr[0]
-		remote.localPort = localAddr[1]
-		remote.remoteAddr = remoteAddr[0]
-		remote.remotePort = remoteAddr[1]
-		remote.currentCSeq = 0
-		remote.connMutex.Unlock()
-
-		return nil
-	}
+	remote.connMutex.Lock()
+	defer remote.connMutex.Unlock()
+	return remote.dialLocked()
 }
 
-// Disconnect closes the socket but keeps the Remote object alive for auto-reconnect.
+// Disconnect closes the socket and clears internal state.
 func (remote *Remote) Disconnect() {
 	remote.connMutex.Lock()
 	defer remote.connMutex.Unlock()
 
-	// Выполняем очистку ТОЛЬКО если соединение действительно активно
 	if remote.RemoteConn != nil {
-		// 🔥 1. ЯВНО ОСТАНАВЛИВАЕМ ВСЕ ФОНОВЫЕ ГОРУТИНЫ (GET_PARAMETER)
-		// Это предотвращает "зомби" запросы после разрыва соединения
-		for _, stream := range remote.streams {
-			for _, session := range stream.sessions {
-				session.Stop()
-			}
-			// Очищаем мапу сессий, чтобы не было утечек памяти
-			stream.sessions = make(map[string]*Session)
-		}
-
-		// 🔥 2. Закрываем сокет
 		remote.RemoteConn.Close()
 		remote.RemoteConn = nil
 
-		// 🔥 3. Очищаем остальное состояние
 		remote.digest.Nonce = ""
-		remote.streams = make(map[string]*Stream)
+		remote.digest.Nc = 0
 		if remote.requests != nil {
 			remote.requests.Init()
 		}
 		remote.currentCSeq = 0
 
-		LogCriticalf("Remote disconnected [%s]. All sessions stopped. State cleared. Will reconnect on demand.", remote.Host)
+		LogCriticalf("Remote connection closed [%s]. State cleared.", remote.Host)
 	}
 }
 
-// Destroy is for full cleanup (e.g., server shutdown)
+// Destroy is for full cleanup (e.g., server shutdown).
 func (remote *Remote) Destroy() error {
-	if remote.RemoteConn != nil {
-		remote.RemoteConn.Close()
-	}
+	remote.Disconnect()
 	return nil
 }
 
@@ -155,27 +99,29 @@ func (remote *Remote) HandleUpstreamResponse(recv string) {
 
 	remote.connMutex.Lock()
 	requestEl := remote.requests.Front()
-	remote.connMutex.Unlock()
-
 	if requestEl == nil {
+		remote.connMutex.Unlock()
 		LogCriticalf("⚠️ [QUEUE] Received response but queue is empty! Dropping.")
 		return
 	}
-
 	request := requestEl.Value.(*Request)
+	// We don't remove yet, in case we need to retry (401)
+	remote.connMutex.Unlock()
+
 	status := "ok"
 
 	if response.Code == 401 && request.Attempts == 0 {
-		if wwwAuthenticate, ok := response.Headers["WWW-Authenticate"]; ok {
+		wwwAuthenticate := headerGet(response.Headers, "WWW-Authenticate")
+		if wwwAuthenticate != "" {
 			if remote.digest.Username != "" && remote.digest.Password != "" && remote.handleAuthenticationFailure(wwwAuthenticate) {
 				request.Attempts++
 				Logf("🔑 [AUTH] Retrying with Digest auth (CSeq will be updated)...")
-				remote.SendRequest(request)
-				return // Still in queue
-			} else {
-				LogCriticalf("❌ [AUTH] Auth failed or missing credentials.")
-				status = "unauthorized"
+				_ = remote.SendRequest(request)
+				return
 			}
+			LogCriticalf("❌ [AUTH] Auth failed or missing credentials.")
+			GlobalMetrics.AuthFailures.Add(1)
+			status = "unauthorized"
 		}
 	} else {
 		if response.Code >= 400 {
@@ -197,44 +143,64 @@ func (remote *Remote) HandleUpstreamResponse(recv string) {
 		}
 	}
 
+	// Finalize request: remove from queue and notify subscribers
 	remote.connMutex.Lock()
-	remote.requests.Remove(requestEl)
+	found := false
+	for e := remote.requests.Front(); e != nil; e = e.Next() {
+		if e == requestEl {
+			remote.requests.Remove(e)
+			found = true
+			break
+		}
+	}
 	remote.connMutex.Unlock()
 
-	for e := request.Subscriptions.Front(); e != nil; e = e.Next() {
-		ch := e.Value.(chan string)
-		func() {
-			defer func() { recover() }()
-			ch <- status
-		}()
-		request.Subscriptions.Remove(e)
+	if found {
+		for e := request.Subscriptions.Front(); e != nil; e = e.Next() {
+			ch := e.Value.(chan string)
+			func() {
+				defer func() { recover() }()
+				select {
+				case ch <- status:
+				default:
+				}
+			}()
+		}
 	}
 }
 
 func (remote *Remote) handleTeardown(request *Request, response *Response) {
-	streamName := request.URL.Path
-	remote.connMutex.Lock()
-	stream := remote.streams[streamName]
-	remote.connMutex.Unlock()
+	stream := remote.stream
 	if stream == nil {
 		return
 	}
-	session := stream.LookupSession(request.Headers["Session"])
+	sessionID := headerGet(request.Headers, "Session")
+	session := stream.LookupSession(sessionID)
 	session.Stop()
-	delete(stream.sessions, request.Headers["Session"])
+	stream.mu.Lock()
+	delete(stream.sessions, sessionID)
+	stream.mu.Unlock()
 }
 
 func (remote *Remote) handleOptions(request *Request, response *Response) {
-	streamName := request.URL.Path
-	stream := remote.lookupStreamInternal(streamName)
-	stream.Options = response.Headers["Public"]
-	stream.Server = response.Headers["Server"]
+	stream := remote.stream
+	if stream == nil {
+		return
+	}
+	stream.mu.Lock()
+	stream.Options = headerGet(response.Headers, "Public")
+	stream.Server = headerGet(response.Headers, "Server")
+	stream.mu.Unlock()
 }
 
 func (remote *Remote) handleDescribe(request *Request, response *Response) {
-	streamName := request.URL.Path
-	stream := remote.lookupStreamInternal(streamName)
+	stream := remote.stream
+	if stream == nil {
+		return
+	}
+	stream.mu.Lock()
 	stream.SDP = response.Body
+	stream.mu.Unlock()
 }
 
 func (remote *Remote) parseTransport(transportStr string) (string, string, map[string]string) {
@@ -250,7 +216,7 @@ func (remote *Remote) parseTransport(transportStr string) (string, string, map[s
 	params := make(map[string]string)
 	if len(transportParts) > 2 {
 		for _, element := range transportParts[2:] {
-			kv := strings.Split(element, "=")
+			kv := strings.SplitN(element, "=", 2)
 			if len(kv) == 2 {
 				params[kv[0]] = kv[1]
 			}
@@ -260,49 +226,54 @@ func (remote *Remote) parseTransport(transportStr string) (string, string, map[s
 }
 
 func (remote *Remote) handleSetup(request *Request, response *Response) {
-	streamName, substreamName := filepath.Split(request.URL.Path)
-	streamName = filepath.Dir(streamName)
-	protocol, comType, params := remote.parseTransport(response.Headers["Transport"])
-	stream := remote.lookupStreamInternal(streamName)
-	sessionParams := strings.Split(response.Headers["Session"], ";")
+	stream := remote.stream
+	if stream == nil {
+		return
+	}
+	_, substreamName := filepath.Split(request.URL.Path)
+	protocol, comType, params := remote.parseTransport(headerGet(response.Headers, "Transport"))
+	sessionParams := strings.Split(headerGet(response.Headers, "Session"), ";")
 	session := stream.LookupSession(sessionParams[0])
 	transport := session.LookupTransport(substreamName, protocol, comType)
+
+	transport.mu.Lock()
 	transport.Ssrc = params["ssrc"]
 
 	if interleaved, ok := params["interleaved"]; ok {
 		channels := strings.Split(interleaved, "-")
 		ch1, _ := strconv.Atoi(channels[0])
-		transport.Substreams[0] = NewSubstream(transport, substreamName)
-		transport.Substreams[0].Channel = ch1
+		sub1 := NewSubstream(transport, substreamName)
+		sub1.Channel = ch1
+		transport.Substreams[0] = sub1
 		if len(channels) > 1 {
 			ch2, _ := strconv.Atoi(channels[1])
-			transport.Substreams[1] = NewSubstream(transport, substreamName)
-			transport.Substreams[1].Channel = ch2
+			sub2 := NewSubstream(transport, substreamName)
+			sub2.Channel = ch2
+			transport.Substreams[1] = sub2
 		}
 	}
+	transport.mu.Unlock()
 
 	if len(sessionParams) > 1 {
-		params := make(map[string]string)
 		for _, element := range sessionParams[1:] {
-			kv := strings.Split(element, "=")
-			if len(kv) == 2 {
-				params[kv[0]] = kv[1]
+			kv := strings.SplitN(element, "=", 2)
+			if len(kv) == 2 && kv[0] == "timeout" {
+				session.Timeout, _ = strconv.Atoi(kv[1])
 			}
-		}
-		if timeout, ok := params["timeout"]; ok {
-			session.Timeout, _ = strconv.Atoi(timeout)
 		}
 	}
 }
 
 func (remote *Remote) handlePlay(request *Request, response *Response) {
-	streamName := request.URL.Path
-	stream := remote.lookupStreamInternal(streamName)
-	rtpInfo := response.Headers["RTP-Info"]
-	session := stream.LookupSession(request.Headers["Session"])
-	transports := session.Transports
+	stream := remote.stream
+	if stream == nil {
+		return
+	}
+	rtpInfo := headerGet(response.Headers, "RTP-Info")
+	session := stream.LookupSession(headerGet(request.Headers, "Session"))
 
 	if rtpInfo == "" {
+		session.StartUpstream()
 		return
 	}
 
@@ -316,25 +287,31 @@ func (remote *Remote) handlePlay(request *Request, response *Response) {
 		}
 		URL, _ := url.Parse(params["url"])
 		_, substreamName := filepath.Split(URL.Path)
-		for e := transports.Front(); e != nil; e = e.Next() {
+
+		session.mu.Lock()
+		for e := session.Transports.Front(); e != nil; e = e.Next() {
 			transport := e.Value.(*Transport)
 			if transport.SubstreamName == substreamName {
-				transport.Substreams[0].Seq, _ = strconv.Atoi(params["seq"])
-				transport.Substreams[0].RTPTime, _ = strconv.Atoi(params["rtptime"])
+				transport.mu.Lock()
+				if sub, ok := transport.Substreams[0]; ok {
+					sub.Seq, _ = strconv.Atoi(params["seq"])
+					sub.RTPTime, _ = strconv.Atoi(params["rtptime"])
+				}
+				transport.mu.Unlock()
 			}
 		}
+		session.mu.Unlock()
 	}
 	session.StartUpstream()
 }
 
 // GetOptions retrieves the OPTIONS response for a given stream.
 func (remote *Remote) GetOptions(streamName string) (string, error) {
-	remote.connMutex.Lock()
-	stream := remote.streams[streamName]
-	remote.connMutex.Unlock()
-
-	if stream == nil || stream.Options == "" {
-		// 🔥 ИСПРАВЛЕНИЕ: Используем реальный streamName, а не "/"
+	stream := remote.stream
+	if stream == nil {
+		return "", errors.New("no stream bound")
+	}
+	if stream.GetOptions() == "" {
 		URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: streamName}
 		request, _ := NewRequest("OPTIONS", URL)
 		err := remote.SendRequestSync(request)
@@ -342,25 +319,16 @@ func (remote *Remote) GetOptions(streamName string) (string, error) {
 			return "", err
 		}
 	}
-
-	remote.connMutex.Lock()
-	stream = remote.streams[streamName]
-	remote.connMutex.Unlock()
-
-	if stream != nil {
-		return stream.Options, nil
-	}
-	return "", nil
+	return stream.GetOptions(), nil
 }
 
 // GetSDP retrieves the SDP description for a given stream.
 func (remote *Remote) GetSDP(streamName string) (string, error) {
-	remote.connMutex.Lock()
-	stream := remote.streams[streamName]
-	remote.connMutex.Unlock()
-
-	if stream == nil || stream.SDP == "" {
-		// Здесь уже было правильно: Path: streamName
+	stream := remote.stream
+	if stream == nil {
+		return "", errors.New("no stream bound")
+	}
+	if stream.GetSDP() == "" {
 		URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: streamName}
 		request, _ := NewRequest("DESCRIBE", URL)
 		err := remote.SendRequestSync(request)
@@ -368,15 +336,7 @@ func (remote *Remote) GetSDP(streamName string) (string, error) {
 			return "", err
 		}
 	}
-
-	remote.connMutex.Lock()
-	stream = remote.streams[streamName]
-	remote.connMutex.Unlock()
-
-	if stream != nil {
-		return stream.SDP, nil
-	}
-	return "", nil
+	return stream.GetSDP(), nil
 }
 
 // SetupUpstream performs a SETUP request for the upstream connection.
@@ -388,7 +348,6 @@ func (remote *Remote) SetupUpstream(stream *Stream, track, transportStr string) 
 	} else if strings.HasPrefix(track, "rtsp://") {
 		reqURL, _ = url.Parse(track)
 	} else {
-		// 🔥 Безопасное объединение путей для URL (избегаем filepath.Join и кодирования %2A)
 		basePath := strings.TrimRight(stream.Path, "/")
 		trackPath := strings.TrimLeft(track, "/")
 		fullPath := basePath + "/" + trackPath
@@ -402,22 +361,24 @@ func (remote *Remote) SetupUpstream(stream *Stream, track, transportStr string) 
 		return "", "", err
 	}
 
-	remote.connMutex.Lock()
-	rs := remote.streams[stream.Path]
-	remote.connMutex.Unlock()
-
-	if rs == nil {
-		return "", "", errors.New("stream not found after SETUP")
-	}
-
-	for _, sess := range rs.sessions {
+	stream.mu.RLock()
+	defer stream.mu.RUnlock()
+	for _, sess := range stream.sessions {
+		sess.mu.RLock()
 		for e := sess.Transports.Front(); e != nil; e = e.Next() {
 			t := e.Value.(*Transport)
-			// Ищем транспорт по имени трека или базовому пути
-			if t.SubstreamName == track || (track == "" && t.SubstreamName == filepath.Base(stream.Path)) || (track != "" && t.SubstreamName == filepath.Base(track)) {
-				return t.Ssrc, sess.Session, nil
+			base := filepath.Base(track)
+			if t.SubstreamName == track ||
+				(track == "" && t.SubstreamName == filepath.Base(stream.Path)) ||
+				(track != "" && (t.SubstreamName == base || t.SubstreamName == track)) {
+				t.mu.RLock()
+				ssrc := t.Ssrc
+				t.mu.RUnlock()
+				sess.mu.RUnlock()
+				return ssrc, sess.Session, nil
 			}
 		}
+		sess.mu.RUnlock()
 	}
 
 	return "", "", errors.New("failed to find transport after SETUP")
@@ -435,12 +396,12 @@ func (remote *Remote) PlayUpstream(path, sessionID string) (string, error) {
 		return "", err
 	}
 
-	remote.connMutex.Lock()
-	rs := remote.streams[path]
-	remote.connMutex.Unlock()
-
-	if rs != nil {
-		if sess, ok := rs.sessions[sessionID]; ok {
+	stream := remote.stream
+	if stream != nil {
+		stream.mu.RLock()
+		sess, ok := stream.sessions[sessionID]
+		stream.mu.RUnlock()
+		if ok {
 			sess.StartUpstream()
 		}
 	}
@@ -448,48 +409,33 @@ func (remote *Remote) PlayUpstream(path, sessionID string) (string, error) {
 	return "ok", nil
 }
 
-// LookupTransport retrieves an existing transport for a substream.
+// LookupTransport retrieves an existing transport for a substream from the parent Stream.
 func (remote *Remote) LookupTransport(streamName, substreamName, protocol, comType string) *Transport {
-	remote.connMutex.Lock()
-	stream, ok := remote.streams[streamName]
-	remote.connMutex.Unlock()
-	if !ok {
+	stream := remote.stream
+	if stream == nil {
 		return nil
 	}
+	stream.mu.RLock()
+	defer stream.mu.RUnlock()
 	for _, session := range stream.sessions {
+		session.mu.RLock()
 		for e := session.Transports.Front(); e != nil; e = e.Next() {
 			transport := e.Value.(*Transport)
 			if transport.SubstreamName == substreamName && transport.Protocol == protocol && transport.ComType == comType {
+				session.mu.RUnlock()
 				return transport
 			}
 		}
+		session.mu.RUnlock()
 	}
 	return nil
 }
 
-// Internal LookupStream for Remote's internal tracking
-func (remote *Remote) lookupStreamInternal(streamName string) *Stream {
-	remote.connMutex.Lock()
-	defer remote.connMutex.Unlock()
-	if stream, ok := remote.streams[streamName]; ok {
-		return stream
-	}
-	stream := &Stream{
-		Path:     streamName,
-		sessions: make(map[string]*Session),
-	}
-	remote.streams[streamName] = stream
-	return stream
-}
-
-// SendRequestSync sends an RTSP request to the remote server and waits for a synchronous response.
+// SendRequestSync sends an RTSP request and waits for a synchronous response.
 func (remote *Remote) SendRequestSync(request *Request) error {
-	// 🔥 HIKVISION FIX: Делаем до 2 попыток. Если первая зависает (устаревший nonce),
-	// очищаем nonce и пробуем снова, чтобы принудительно получить 401挑战.
 	for attempt := 0; attempt < 2; attempt++ {
-		ipc := NewIPC(10, 100)
+		ipc := NewIPC(10)
 
-		// Очищаем список подписчиков перед новой попыткой, чтобы не было утечек или дубликатов
 		if request.Subscriptions == nil {
 			request.Subscriptions = list.New()
 		} else {
@@ -503,85 +449,147 @@ func (remote *Remote) SendRequestSync(request *Request) error {
 
 		err := remote.SendRequest(request)
 		if err != nil {
+			remote.connMutex.Lock()
+			for e := remote.requests.Front(); e != nil; e = e.Next() {
+				if e.Value.(*Request) == request {
+					remote.requests.Remove(e)
+					break
+				}
+			}
+			remote.connMutex.Unlock()
 			return err
 		}
 
-		result := ipc.GetResponse()
+		result := ipc.GetResponse(remote.stream.ctx)
 
-		// If server is shutting down, return immediately
 		select {
+		case <-remote.stream.ctx.Done():
+			return errors.New("stream destroyed, request aborted")
 		case <-remote.Server.ctx.Done():
 			return errors.New("server is shutting down, request aborted")
 		default:
-			// continue
 		}
 
-		// Если произошел таймаут и это первая попытка
-		if result == "timeout" && attempt == 0 {
-			Logf("⚠️ [AUTH] Request timed out (camera silently dropped stale nonce). Clearing nonce and retrying...")
-			remote.digest.Nonce = "" // Очищаем старый nonce
-			request.Attempts = 0     // Сбрасываем счетчик попыток для корректной обработки 401
-			continue                 // Переходим ко второй итерации цикла
+		if result == "timeout" {
+			remote.connMutex.Lock()
+			for e := remote.requests.Front(); e != nil; e = e.Next() {
+				if e.Value.(*Request) == request {
+					remote.requests.Remove(e)
+					break
+				}
+			}
+
+			if attempt == 0 {
+				Logf("⚠️ [AUTH] Request timed out (camera silently dropped stale nonce). Clearing nonce and retrying...")
+				remote.digest.Nonce = ""
+				remote.digest.Nc = 0
+				remote.connMutex.Unlock()
+				request.Attempts = 0
+				continue
+			}
+			remote.connMutex.Unlock()
 		}
 
 		if result != "ok" {
 			return errors.New(result)
 		}
 
-		return nil // Успех
+		return nil
 	}
 
 	return errors.New("timeout after retry")
 }
 
 // SendRequest sends an RTSP request to the remote server.
+// Enforces strict atomicity for the entire request string.
 func (remote *Remote) SendRequest(request *Request) error {
+	remote.connMutex.Lock()
+	defer remote.connMutex.Unlock()
+
+	if remote.RemoteConn == nil {
+		err := remote.dialLocked()
+		if err != nil {
+			return err
+		}
+	}
+	conn := remote.RemoteConn
+
+	remote.currentCSeq++
+	request.Headers["CSeq"] = strconv.Itoa(remote.currentCSeq)
+	remote.createAuthenticatorStr(request)
+
+	rawRequest := []byte(request.String())
+	Logf("📤 RAW REQUEST TO CAMERA [%s]:\n%s", remote.Host, string(rawRequest))
+
+	conn.SetWriteDeadline(time.Now().Add(GlobalConfig.WriteTimeout))
+	_, err := conn.Write(rawRequest)
+	conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		remote.disconnectLocked()
+		return fmt.Errorf("failed to write to remote: %w", err)
+	}
+	return nil
+}
+
+func (remote *Remote) dialLocked() error {
 	select {
 	case <-remote.Server.ctx.Done():
 		return fmt.Errorf("server is shutting down")
 	default:
-		remote.connMutex.Lock()
-		if remote.RemoteConn == nil {
-			remote.connMutex.Unlock()
-			err := remote.Dial()
-			if err != nil {
-				return err
-			}
-			remote.connMutex.Lock()
-		}
-		conn := remote.RemoteConn
-		remote.connMutex.Unlock()
-
-		remote.currentCSeq++
-		request.Headers["CSeq"] = strconv.Itoa(remote.currentCSeq)
-		remote.createAuthenticatorStr(request)
-
-		rawRequest := []byte(request.String())
-		Logf("📤 RAW REQUEST TO CAMERA [%s]:\n%s", remote.Host, string(rawRequest))
-
-		conn.SetWriteDeadline(time.Now().Add(GlobalConfig.WriteTimeout))
-		_, err := conn.Write(rawRequest)
-		conn.SetWriteDeadline(time.Time{})
+		dialer := net.Dialer{Timeout: GlobalConfig.DialTimeout}
+		socket, err := dialer.DialContext(remote.Server.ctx, "tcp", remote.Host)
 		if err != nil {
-			remote.Disconnect()
-			return fmt.Errorf("failed to write to remote: %w", err)
+			GlobalMetrics.ConnectErrors.Add(1)
+			return fmt.Errorf("failed to connect to %q: %w", remote.Host, err)
 		}
+
+		localAddr := strings.Split(socket.LocalAddr().String(), ":")
+		remoteAddr := strings.Split(socket.RemoteAddr().String(), ":")
+
+		if remote.RemoteConn != nil {
+			remote.RemoteConn.Close()
+		}
+		remote.RemoteConn, _ = socket.(*net.TCPConn)
+		remote.localAddr = localAddr[0]
+		remote.localPort = localAddr[1]
+		remote.remoteAddr = remoteAddr[0]
+		remote.remotePort = remoteAddr[1]
+		remote.currentCSeq = 0
+
 		return nil
 	}
 }
 
-// SendBinary forwards interleaved RTP/RTCP data from client to remote
+// SendTeardown sends a TEARDOWN request for a specific session.
+func (remote *Remote) SendTeardown(path, sessionID string) error {
+	URL := &url.URL{Scheme: "rtsp", Host: remote.Host, Path: path}
+	request, _ := NewRequest("TEARDOWN", URL)
+	request.Headers["Session"] = sessionID
+	return remote.SendRequest(request)
+}
+
+// binaryHeaderPool avoids allocation for interleaved data headers.
+var binaryHeaderPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 4)
+	},
+}
+
+// SendBinary forwards interleaved RTP/RTCP data from client to remote.
+// Enforces strict atomicity to prevent stream corruption.
 func (remote *Remote) SendBinary(channel int, data []byte) error {
 	remote.connMutex.Lock()
+	defer remote.connMutex.Unlock()
+
 	if remote.RemoteConn == nil {
-		remote.connMutex.Unlock()
 		LogCriticalf("⚠️ SendBinary failed: remote connection is closed")
 		return errors.New("remote connection is closed")
 	}
 	conn := remote.RemoteConn
-	remote.connMutex.Unlock()
 
-	header := make([]byte, 4)
+	header := binaryHeaderPool.Get().([]byte)
+	defer binaryHeaderPool.Put(header)
+
 	header[0] = '$'
 	header[1] = byte(channel)
 	header[2] = byte((len(data) & 0xFF00) >> 8)
@@ -592,54 +600,88 @@ func (remote *Remote) SendBinary(channel int, data []byte) error {
 	if err != nil {
 		conn.SetWriteDeadline(time.Time{})
 		LogCriticalf("⚠️ SendBinary header failed: %v", err)
-		remote.Disconnect()
+		remote.disconnectLocked()
 		return fmt.Errorf("failed to write binary header: %w", err)
 	}
+
 	_, err = conn.Write(data)
 	conn.SetWriteDeadline(time.Time{})
 	if err != nil {
 		LogCriticalf("⚠️ SendBinary data failed: %v", err)
-		remote.Disconnect()
+		remote.disconnectLocked()
 		return fmt.Errorf("failed to write binary data: %w", err)
-	} else {
-		Logf("✅ Successfully sent binary data to camera on channel %d, len %d", channel, len(data))
 	}
-	return err
+	return nil
+}
+
+// disconnectLocked is used internally when connMutex is already held.
+func (remote *Remote) disconnectLocked() {
+	if remote.RemoteConn != nil {
+		remote.RemoteConn.Close()
+		remote.RemoteConn = nil
+		remote.digest.Nonce = ""
+		remote.digest.Nc = 0
+		if remote.requests != nil {
+			remote.requests.Init()
+		}
+		remote.currentCSeq = 0
+		LogCriticalf("Remote connection closed [%s] due to error.", remote.Host)
+	}
 }
 
 func (remote *Remote) handleAuthenticationFailure(paramsStr string) bool {
-	if paramsStr == "" || remote.digest.Username == "" || remote.digest.Password == "" {
+	if paramsStr == "" {
+		return false
+	}
+	remote.connMutex.Lock()
+	defer remote.connMutex.Unlock()
+	if remote.digest.Username == "" || remote.digest.Password == "" {
 		return false
 	}
 
-	digestRegex := regexp.MustCompile(`Digest realm="([^"]+)", nonce="([^"]+)"`)
-	basicRegex := regexp.MustCompile(`Basic realm="([^"]+)"`)
-
-	if matches := digestRegex.FindStringSubmatch(paramsStr); len(matches) == 3 {
-		remote.digest.Realm = matches[1]
-		remote.digest.Nonce = matches[2] // 🔥 ОБЯЗАТЕЛЬНО обновляем Nonce каждый раз!
-		Logf("✅ [AUTH] Updated Digest: Realm=%q, New Nonce=%q", remote.digest.Realm, remote.digest.Nonce)
-		return true
-	} else if matches := basicRegex.FindStringSubmatch(paramsStr); len(matches) == 2 {
-		remote.digest.Realm = matches[1]
+	realm, nonce, qop, opaque, algorithm, isDigest := ParseWWWAuthenticate(paramsStr)
+	if isDigest {
+		remote.digest.Realm = realm
+		remote.digest.Nonce = nonce
+		remote.digest.Qop = qop
+		remote.digest.Opaque = opaque
+		remote.digest.Algorithm = algorithm
+		remote.digest.Nc = 0 // reset nonce count on new challenge
+		Logf("✅ [AUTH] Updated Digest: Realm=%q, Nonce=%q, Qop=%q", remote.digest.Realm, remote.digest.Nonce, remote.digest.Qop)
 		return true
 	}
-
+	if realm != "" {
+		// Basic
+		remote.digest.Realm = realm
+		remote.digest.Nonce = ""
+		return true
+	}
 	return false
 }
 
 func (remote *Remote) createAuthenticatorStr(request *Request) {
-	if remote.digest.Realm != "" && remote.digest.Username != "" && remote.digest.Password != "" {
-		var response string
-		if remote.digest.Nonce != "" {
-			URL := request.GetURL().String()
-			response = remote.digest.ComputeResponse(request.Method, URL)
-			request.Headers["Authorization"] = fmt.Sprintf(`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
-				remote.digest.Username, remote.digest.Realm, remote.digest.Nonce, URL, response)
-		} else {
-			usernamePassword := fmt.Sprintf("%s:%s", remote.digest.Username, remote.digest.Password)
-			response = base64.StdEncoding.EncodeToString([]byte(usernamePassword))
-			request.Headers["Authorization"] = fmt.Sprintf("Basic %s", response)
+	if remote.digest.Realm == "" || remote.digest.Username == "" || remote.digest.Password == "" {
+		return
+	}
+	URL := request.GetURL().String()
+	if remote.digest.Nonce != "" {
+		response, ncStr, cnonce := remote.digest.ComputeResponse(request.Method, URL)
+		var auth strings.Builder
+		auth.WriteString(fmt.Sprintf(`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
+			remote.digest.Username, remote.digest.Realm, remote.digest.Nonce, URL, response))
+		if remote.digest.Qop != "" {
+			auth.WriteString(fmt.Sprintf(`, qop=%s, nc=%s, cnonce="%s"`, remote.digest.Qop, ncStr, cnonce))
 		}
+		if remote.digest.Opaque != "" {
+			auth.WriteString(fmt.Sprintf(`, opaque="%s"`, remote.digest.Opaque))
+		}
+		if remote.digest.Algorithm != "" && !strings.EqualFold(remote.digest.Algorithm, "MD5") {
+			auth.WriteString(fmt.Sprintf(`, algorithm=%s`, remote.digest.Algorithm))
+		}
+		request.Headers["Authorization"] = auth.String()
+	} else {
+		usernamePassword := fmt.Sprintf("%s:%s", remote.digest.Username, remote.digest.Password)
+		encoded := base64.StdEncoding.EncodeToString([]byte(usernamePassword))
+		request.Headers["Authorization"] = fmt.Sprintf("Basic %s", encoded)
 	}
 }

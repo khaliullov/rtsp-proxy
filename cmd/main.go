@@ -16,9 +16,20 @@ func main() {
 	var logFile string
 	var portNum int
 	var verbose bool
+	var idleTimeout time.Duration
+	var packetQueueSize int
+	var bufferSize int
+	var dialTimeout time.Duration
+	var metricsPort int
+
 	flag.StringVar(&logFile, "log", "-", "log file")
 	flag.IntVar(&portNum, "port", 554, "server port")
 	flag.BoolVar(&verbose, "verbose", false, "enable verbose logging")
+	flag.DurationVar(&idleTimeout, "idle-timeout", 20*time.Second, "idle upstream disconnect timeout")
+	flag.IntVar(&packetQueueSize, "packet-queue-size", 1000, "per-client packet queue size")
+	flag.IntVar(&bufferSize, "buffer-size", 65536, "RTP/RTSP read buffer size in bytes")
+	flag.DurationVar(&dialTimeout, "dial-timeout", 5*time.Second, "upstream dial timeout")
+	flag.IntVar(&metricsPort, "metrics-port", 0, "Prometheus metrics HTTP port (0=disabled)")
 	flag.Parse()
 
 	if logFile == "-" {
@@ -32,17 +43,27 @@ func main() {
 		log.SetOutput(f)
 	}
 
-	rtspproxy.SetVerbose(verbose) // Set the verbose flag in the rtspproxy package
+	// Apply CLI overrides to GlobalConfig before any Stream/Client is created
+	cfg := rtspproxy.GlobalConfig
+	cfg.IdleTimeout = idleTimeout
+	cfg.PacketQueueSize = packetQueueSize
+	cfg.BufferSize = bufferSize
+	cfg.DialTimeout = dialTimeout
+	cfg.MetricsPort = metricsPort
 
-	// Create a context that can be cancelled to signal shutdown
+	rtspproxy.SetVerbose(verbose)
+
+	if err := rtspproxy.StartMetricsServer(metricsPort); err != nil {
+		log.Fatalf("metrics server: %v", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // Ensure cancel is called eventually
+	defer cancel()
 
-	// Listen for OS signals for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	server := rtspproxy.NewServer(ctx) // Pass the context to the server
+	server := rtspproxy.NewServer(ctx)
 
 	err := server.Listen(portNum)
 	if err != nil {
@@ -53,7 +74,6 @@ func main() {
 
 	go server.Start()
 
-	// Block until a signal is received or context is cancelled
 	select {
 	case sig := <-sigChan:
 		rtspproxy.LogCriticalf("Received signal: %v. Shutting down...", sig)
@@ -61,13 +81,16 @@ func main() {
 		rtspproxy.LogCriticalf("Context cancelled. Shutting down...")
 	}
 
-	// Initiate graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		rtspproxy.LogCriticalf("Server shutdown error: %v", err)
 		os.Exit(1)
+	}
+
+	if err := rtspproxy.ShutdownMetricsServer(shutdownCtx); err != nil {
+		rtspproxy.LogCriticalf("Metrics shutdown error: %v", err)
 	}
 
 	rtspproxy.LogCriticalf("Server gracefully stopped.")
