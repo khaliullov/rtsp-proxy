@@ -393,7 +393,7 @@ func (client *Client) handleSetup(stream *Stream, request *Request) *Response {
 	// Гарантируем, что процесс подключения запущен
 	stream.Start()
 
-	// 🔥 Ждем, пока connectLoop завершит OPTIONS, DESCRIBE, SETUP и PLAY (StatePlaying)
+	// Wait for stream to reach StatePlaying (via connectLoop)
 	select {
 	case <-client.server.ctx.Done():
 		return client.responseBadRequest(request)
@@ -451,7 +451,7 @@ func (client *Client) handleSetup(stream *Stream, request *Request) *Response {
 func (client *Client) handleDescribe(stream *Stream, request *Request) *Response {
 	stream.Start()
 
-	// Wait for SDP to be available (increased timeout to 10s)
+	// Wait for SDP to be available
 	select {
 	case <-client.server.ctx.Done():
 		return client.responseBadRequest(request)

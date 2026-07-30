@@ -97,10 +97,12 @@ func (response *Response) ParseResponse(buffer string) error {
 	}
 	if contentLengthRaw := headerGet(response.Headers, "Content-Length"); contentLengthRaw != "" {
 		contentLength, _ := strconv.Atoi(contentLengthRaw)
-		if contentLength > 0 && contentLength <= len(next) {
-			response.Body = next[:contentLength]
-		} else if contentLength > 0 {
-			response.Body = next
+		if contentLength > 0 {
+			if contentLength <= len(next) {
+				response.Body = next[:contentLength]
+			} else {
+				response.Body = next
+			}
 		}
 		return nil
 	}
