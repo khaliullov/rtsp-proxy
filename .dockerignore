@@ -1,0 +1,10 @@
+.git
+.gitignore
+*.md
+**/*_test.go
+**/testdata
+Dockerfile
+.dockerignore
+*.log
+bin/
+dist/
