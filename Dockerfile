@@ -16,7 +16,7 @@ RUN go mod download 2>/dev/null || true
 COPY . .
 
 # Static binary, no CGO
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=linux \
     go build -trimpath -ldflags="-s -w" -o /out/rtsp-proxy ./cmd/
 
 # -----------------------------------------------------------------------------
